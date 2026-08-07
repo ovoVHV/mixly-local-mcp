@@ -1,5 +1,5 @@
 # Mixly Local MCP 2.2.0
-
+下载zip文件解压到本地mixly目录，直接用ai客户端调用即可
 这是一个完全在用户电脑上运行的 Mixly MCP。它不需要公网服务器，不上传源码，也不在服务器编译。
 
 任何支持本地 STDIO MCP 的 AI 客户端都可以使用，例如 Codex、Claude Desktop、Cursor 和 Cline。每个客户端需要单独添加一次本地 MCP 配置。
