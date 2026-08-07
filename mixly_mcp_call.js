@@ -6,6 +6,10 @@ const path = require('path');
 const readline = require('readline');
 const { spawn } = require('child_process');
 
+function stripUtf8Bom(text) {
+  return String(text).replace(/^\uFEFF/, '');
+}
+
 const toolName = process.argv[2];
 if (!toolName) {
   console.error('Usage: node mixly_mcp_call.js <tool-name> [json-arguments|--args-file path|@path|-]');
@@ -24,6 +28,7 @@ try {
   } else if (argumentSpec === '-') {
     argumentText = fs.readFileSync(0, 'utf8');
   }
+  argumentText = stripUtf8Bom(argumentText);
   toolArguments = argumentText ? JSON.parse(argumentText) : {};
 } catch (error) {
   console.error(`Invalid JSON arguments: ${error.message}`);

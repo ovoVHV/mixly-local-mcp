@@ -13,6 +13,11 @@ const structuredProject = path.join(testDirectory, 'StructuredChinese.mix');
 const structuredSketch = path.join(testDirectory, 'StructuredChinese', 'StructuredChinese.ino');
 const workflowProject = path.join(testDirectory, 'Workflow.mix');
 const workflowSketch = path.join(testDirectory, 'Workflow', 'Workflow.ino');
+const defaultLibrariesPath = path.join(root, 'arduino-cli', 'libraries');
+const emakefunLibrariesPath = path.join(
+  root, 'resources', 'app', 'src', 'boards', 'default', 'arduino_avr',
+  'libraries', 'ThirdParty', 'Emakefun_tts20', 'libraries'
+);
 const child = spawn(process.execPath, [path.join(__dirname, 'mixly_mcp_server.js')], {
   cwd: root,
   windowsHide: true,
@@ -199,9 +204,14 @@ async function main() {
     overwrite: true,
     cdpPort: 9333,
     waitMs: 60000,
+    sourceText: 'void setup(){}\nvoid loop(){delay(10);}\n',
+    equivalenceMode: 'behavioral-strict',
+    equivalenceRequiredPatterns: ['delay\\s*\\(\\s*10\\s*\\)'],
     compile: true,
     fqbn: 'arduino:avr:nano:cpu=atmega328',
     compileTimeoutMs: 360000,
+    librariesPaths: [defaultLibrariesPath],
+    mixlyLibraries: ['Emakefun_tts20'],
     tree: {
       blocks: [
         { type: 'base_setup', statements: {} },
@@ -216,7 +226,15 @@ async function main() {
   assert.equal(workflow.board, 'default/arduino_avr@Arduino Nano');
   assert.equal(workflow.fqbn, 'arduino:avr:nano');
   assert.equal(workflow.stages.validated.passed, true);
+  assert.equal(workflow.stages.equivalence.mode, 'behavioral-strict');
+  assert.equal(workflow.stages.equivalence.passed, true);
   assert.equal(workflow.stages.compiled.passed, true);
+  assert.deepEqual(workflow.stages.compiled.librariesPaths, [
+    defaultLibrariesPath, emakefunLibrariesPath
+  ]);
+  assert.deepEqual(workflow.stages.compiled.mixlyLibraryPaths, [
+    { name: 'Emakefun_tts20', path: emakefunLibrariesPath }
+  ]);
   assert(fs.existsSync(workflowProject));
   assert(fs.existsSync(workflowSketch));
   console.log('One-call project workflow passed: build, open, validate, generate and compile');

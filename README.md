@@ -1,8 +1,28 @@
-# Mixly Local MCP 2.2.0
-下载zip文件解压到本地mixly目录，直接用ai客户端调用即可
+# Mixly Local MCP 2.3.0
+
+下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
+
 这是一个完全在用户电脑上运行的 Mixly MCP。它不需要公网服务器，不上传源码，也不在服务器编译。
 
 任何支持本地 STDIO MCP 的 AI 客户端都可以使用，例如 Codex、Claude Desktop、Cursor 和 Cline。每个客户端需要单独添加一次本地 MCP 配置。
+
+## 说明视频
+
+- 抖音：[发现米思齐能用 AI 写代码，我直接愣住了](https://v.douyin.com/L0xDb-Hex1o/)
+- 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
+
+以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.3.0 更新说明
+
+- 构建 `.mix` 前按本机官方及 ThirdParty 积木规格校验 `fields`、`values`、`statements`，错误会返回节点 ID、树路径和合法输入名，不再等真实加载时静默丢树。
+- 根据 `IFn/DOn/ELSE` 自动推导 `controls_if` mutation；真实 Blockly 少加载一个节点也会失败，并报告缺失块、父块、父连接和最近成功加载的祖先。
+- 新增 `mixly_verify_equivalence`，支持 `report`、`behavioral-strict`、`exact`；统一工作流可在编译前检查遗漏的保护调用、提示文本、常量、副作用和必需正则。
+- 积木规格新增 `optionalValueInputs`、`valueDefaults`，能说明允许留空且生成 `""`、`0` 等回退代码的输入，无需依赖识图判断空插槽。
+- 参数文件、stdin 和 `treePath` 统一兼容 UTF-8 BOM 与中文路径。
+- Arduino CLI 支持多个隔离 `librariesPaths`，并能按板卡解析 `ThirdParty/<库名>/libraries`，无需把自定义库复制到全局目录。
+- 编译结果新增 Flash/SRAM 百分比和 `resourceRisk`；自定义生成器直接使用未转义的 `VAR` 字段时会给出中文变量兼容警告。
+- MCP 协议现有 18 个工具；发布包已通过官方/ThirdParty 契约、Mixly bundle、真实 Blockly、Nano 编译和便携解包启动回归。
 
 ## 设计原则
 
@@ -17,6 +37,8 @@
 - 建议把全局变量声明通过 `next` 连接为一条栈，并给顶层积木稳定、无重叠的坐标；布局问题只产生提示。
 - 图片是否合适取决于用户要求；未记录用户图片需求时会提示 AI 确认，但不会阻止建库。本版 MCP 不提供识图能力。
 - 只有无效 XML/JavaScript、当前板卡没有该 block type、块定义或生成器缺失、真实 Blockly 节点丢失、代码生成或编译失败等确定不可用的问题才报错。
+- 源码等价性检查是保守的静态审计，用来主动发现遗漏的保护条件、提示文本、常量和副作用调用；它不是形式化证明，也不替代真机测试。
+- 编译结果会保留 Flash/SRAM 等资源占用诊断。接近板卡上限时属于部署风险，AI 应明确提示，不能只根据“编译通过”判断设备运行可靠。
 - ZIP 只有文件条目，没有目录条目，避免 Mixly 导入时出现 `EISDIR`。
 
 ## 本地部署包
@@ -24,7 +46,7 @@
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.2.0.zip
+Mixly_Local_MCP_v2.3.0.zip
 ```
 
 解压后目录包含：
@@ -32,6 +54,8 @@ Mixly_Local_MCP_v2.2.0.zip
 ```text
 MixlyLocalMCP/
   mixly_mcp_server.js
+  mixly_code_equivalence.js
+  test_mixly_code_equivalence.js
   validate_mixly_workspace.js
   mixly_mcp_call.js
   package.json
@@ -117,16 +141,17 @@ MIXLY_HOME = "C:\\Path\\To\\Mixly"
 | `mixly_get_block_specs` | 返回候选块真实 XML、字段、输入、shadow、连接和生成器接口 |
 | `mixly_inspect_library` | 学习标准第三方库目录、语言、媒体、Arduino 库和图片模式 |
 | `mixly_create_library` | 为目标板创建缺失的底层原语，默认生成标准库目录 |
-| `mixly_build_project` | 从结构树或大型 `treePath` 构建、连接并布局 `.mix` |
+| `mixly_build_project` | 从结构树或大型 `treePath` 构建 `.mix`，并在序列化前校验块输入契约、推导 `controls_if` mutation |
 | `mixly_save_project` | 静态检查已有 XML 后原子写入 `.mix` |
 | `mixly_package_library` | 递归打包积木库，保持 0 个目录条目 |
 | `mixly_launch` | 启动或复用带 CDP 端口的本机 Mixly |
 | `mixly_import_library` | 调用 Mixly 自身 API 真实导入 ZIP |
 | `mixly_open_project` | 使用动态发现的板卡配置打开 `.mix` |
-| `mixly_validate_project` | 在真实 Blockly 中检查节点、连接、中文名称、孤立块和重叠 |
+| `mixly_validate_project` | 在真实 Blockly 中检查节点、连接、中文名称、孤立块和重叠；节点丢失时返回类型和父输入诊断 |
 | `mixly_generate_code` | 自动选择当前板卡的 Blockly 生成器，输出 `.ino`、`.py` 等代码 |
-| `mixly_project_workflow` | 一次完成构建、启动、打开、真实验证、代码生成和可选编译 |
-| `mixly_compile` | 可选地调用用户本机 `arduino-cli` 编译 C/C++ 工程 |
+| `mixly_verify_equivalence` | 对参考源码和积木生成代码执行 `report`、`behavioral-strict` 或 `exact` 静态审计 |
+| `mixly_project_workflow` | 一次完成构建、启动、打开、真实验证、代码生成、等价性审计和可选编译 |
+| `mixly_compile` | 调用本机 `arduino-cli`，支持多个隔离库目录及指定 Mixly ThirdParty 库 |
 
 ## AI 推荐工作流
 
@@ -145,12 +170,19 @@ mixly_detect_environment
   -> mixly_package_library
   -> mixly_launch
   -> mixly_import_library
-  -> mixly_project_workflow(treePath=<大型 JSON 树>, compile=<是否编译>)
+  -> mixly_project_workflow(
+       treePath=<大型 JSON 树>,
+       sourcePath=<原始主源码>,
+       equivalenceSupportPaths=<生成端辅助源码列表>,
+       equivalenceMode=behavioral-strict,
+       equivalenceRequiredPatterns=<关键业务规则>,
+       compile=<是否编译>
+     )
 ```
 
 如果环境探测中没有用户需要的板卡，AI 应帮助用户安装对应 Mixly 板卡支持或 Arduino core，然后重新探测，不能偷偷换成固定板卡。板卡选择器也支持 `板卡家族@具体型号`，例如 `default/arduino_avr@Arduino Nano`；具体名称必须来自 `mixly_get_board_profiles` 的本机结果。
 
-`mixly_project_workflow` 是最终闭环工具，不代替前面的源码分析、动态扫描和真实规格读取。C/C++ 编译仍要求 AI 明确传入用户板卡的 `fqbn` 或 `fqbns`，不会把 ESP32、Nano 或任何其他板卡写成默认值。
+`mixly_project_workflow` 是最终闭环工具，不代替前面的源码分析、动态扫描和真实规格读取。传入 `sourcePath` 或 `sourceText` 时，工作流默认用 `report` 模式生成等价性报告；不传源码则跳过该阶段。`equivalenceMode` 可改为 `behavioral-strict` 或 `exact`，生成端自定义库等辅助 `.h/.cpp/.ino` 用 `equivalenceSupportPaths` 传入，必须保留的业务规则用 `equivalenceRequiredPatterns` 明确声明。C/C++ 编译仍要求 AI 明确传入用户板卡的 `fqbn` 或 `fqbns`，不会把 ESP32、Nano 或任何其他板卡写成默认值。
 
 ## 本地积木兼容规则
 
@@ -173,8 +205,10 @@ mixly_detect_environment
 
 - `type`、`field name`、`value name`、`statement name` 原样使用，不能翻译。
 - 默认 shadow 从 `defaultXml` 复制，只修改用户要填写的值。
-- 带 mutation 的 `controls_if`、函数定义和函数调用必须保留 mutation。
-- `mixly_validate_project` 会比较 XML 节点数与真实 Blockly 加载节点数；少一个也失败。
+- 生成器允许插槽留空并提供回退值时，契约会在 `optionalValueInputs` 和 `valueDefaults` 中列出，例如文本输入留空后生成 `""`；这类空位不需要识图，也不会被误报成缺失结构。
+- `mixly_build_project` 会在写 XML 前按本机 block 规格校验 `fields`、`values` 和 `statements`；输入名不存在，或把 `value` 错放进 `statements` 等连接种类不匹配时，会返回树路径和该块允许的契约，避免到真实加载阶段才丢掉整棵子树。动态块和允许留空的输入不按“必填”误判。
+- `controls_if` 会根据实际的 `IF0/DO0`、`IF1/DO1` 等分支以及 `ELSE` 自动推导 `elseif`/`else` mutation；函数定义和调用等其他动态块仍应按真实 `defaultXml` 保留 mutation。
+- `mixly_validate_project` 会比较 XML 节点与真实 Blockly 加载后的节点；少一个也失败，并返回丢失节点的 type、id、树路径和父块输入位置，便于直接定位错误的 `value`/`statement` 名或 mutation。
 
 ## 中文命名
 
@@ -236,7 +270,42 @@ LibraryName/
 }
 ```
 
-服务端直接读文件，不把几万字符 JSON 作为子进程命令行参数，因此不会出现 `ENAMETOOLONG`。构建器会把多个顶层 `variables_declare` 自动连成一个 `next` 栈，并给变量、函数、setup 和主循环分配稳定位置。真实验证还会检查孤立值块和顶层矩形重叠，这些可维护性问题以 `warnings` 返回；只有真实加载后节点数量减少才会失败。
+服务端直接读文件，不把几万字符 JSON 作为子进程命令行参数，因此不会出现 `ENAMETOOLONG`。`treePath` 和 `mixly_mcp_call.js` 的 `--args-file`、`@path`、stdin `-` 都按 UTF-8 读取，并容忍 UTF-8 BOM；中文文件名、中文目录和中文 JSON 值无需转成系统代码页。构建器会把多个顶层 `variables_declare` 自动连成一个 `next` 栈，并给变量、函数、setup 和主循环分配稳定位置。真实验证还会检查孤立值块和顶层矩形重叠，这些可维护性问题以 `warnings` 返回；只有真实加载后节点数量减少才会失败。
+
+## 源码等价性审计
+
+`mixly_verify_equivalence` 用于在积木生成代码后检查明显的业务逻辑遗漏。独立调用示例：
+
+```json
+{
+  "sourcePath": "C:\\Project\\原始源码.ino",
+  "generatedPath": "C:\\Project\\积木生成代码.ino",
+  "supportPaths": [
+    "C:\\Project\\CanteenSystem.h",
+    "C:\\Project\\CanteenSystem.cpp"
+  ],
+  "mode": "behavioral-strict",
+  "requiredPatterns": [
+    {
+      "label": "重复卡保护",
+      "pattern": "isUidRegistered\\s*\\("
+    }
+  ],
+  "ignoreStrings": ["> "],
+  "ignoreIdentifiers": ["serialEvent"],
+  "allowExternalPath": true
+}
+```
+
+也可用 `sourceText`、`generatedText` 直接传内容。三种模式的含义：
+
+- `report`：只报告缺失的保护条件调用、可见字符串、常量、副作用调用和必需正则，不因差异判失败；工作流有原始源码时默认使用此模式。
+- `behavioral-strict`：上述保守检查发现任何缺口就失败，适合交付前审计。它可能对等价改写产生误报，可用 `ignoreStrings`、`ignoreIdentifiers` 排除已人工确认的差异。
+- `exact`：忽略注释和空白后比较文本；适合要求生成结果保持原代码形态的场景，正常重构通常不会通过。
+
+`requiredPatterns` 是对生成代码执行的正则断言，适合登记重复注册保护、权限检查、故障分支等不能仅靠通用统计可靠推断的规则。`supportPaths` 把生成端自定义 Arduino 库等辅助源码与 `generatedPath` 一起纳入审计；工作流中对应参数名为 `equivalenceSupportPaths` 和 `equivalenceRequiredPatterns`。
+
+这套检查能抓出“原源码有 `isUidRegistered()` 防重复注册，生成代码却漏掉”的问题，但它只是保守静态审计，不是语义等价的形式化证明。通过后仍需真实 Blockly 验证、编译以及必要的硬件测试。
 
 ## Arduino CLI 规则
 
@@ -260,7 +329,21 @@ MCP 只负责调用，不负责下载或强制指定 CLI。探测顺序包括：
 
 需要验证多个配置时传 `fqbns` 数组。单个 FQBN 默认超时为 900000 毫秒，可通过 `timeoutMs` 调整到 1000 至 3600000 毫秒。MCP 不再默认 Nano，也不会擅自选择 ESP32、ESP8266 或其他板卡。
 
+Arduino 库不必复制进全局 `arduino-cli/libraries`。旧参数 `librariesPath` 仍可传一个目录；`librariesPaths` 可传多个相互隔离的目录，MCP 去重后分别作为 `--libraries` 参数交给 CLI。当前板卡的自定义积木库可通过以下参数按名称解析：
+
+```json
+{
+  "board": "default/arduino_avr@Arduino Nano",
+  "mixlyLibraries": ["CanteenSystem"],
+  "librariesPaths": ["C:\\Project\\shared-libraries"]
+}
+```
+
+`mixlyLibraries` 只会解析所选板卡 `libraries/ThirdParty/<名称>/libraries` 下的 Arduino 库，并校验名称和目录边界；不会扫描或复制其他 ThirdParty 库，也不会污染全局库目录。编译返回中保留实际使用的 `librariesPaths` 和解析后的 `mixlyLibraryPaths`，便于复现依赖集合。
+
 Arduino CLI 会把草图目录内的全部 `.ino` 合并编译。原始参考源码、另一份生成代码或测试草图不能以 `.ino` 形式放在同一目录，否则会出现 `setup()` / `loop()` 重定义；参考代码改用 `.txt`，不同可编译草图放入各自同名目录。直接传入不在同名草图目录中的单个 `.ino` 时，MCP 会自动暂存为 Arduino CLI 接受的目录结构，并在结束后清理。
+
+编译成功不等于资源充足。MCP 会从 CLI 输出提取 Flash 和 SRAM 的已用量、上限与百分比，并在 `resourceRisk` 中汇总风险：Flash 从 80% 起提示、90% 起为高风险；SRAM 从 70% 起提示、80% 起为高风险。AI 应把实际数字写进交付结果。尤其是 AVR 上 SRAM 占用很高时，即使编译通过，运行期仍可能因栈、动态字符串或库缓冲区继续增长而不稳定。CLI 输出格式无法识别时风险级别为 `unknown`，不能据此宣称资源安全。
 
 ## 路径安全
 
@@ -280,10 +363,16 @@ Arduino CLI 会把草图目录内的全部 `.ino` 合并编译。原始参考源
 node MixlyLocalMCP\mixly_mcp_call.js mixly_detect_environment
 ```
 
-大型 JSON 参数可通过 `--args-file path`、`@path` 或 stdin `-` 传给命令行测试客户端，避免命令行长度和转义问题：
+大型 JSON 参数可通过 `--args-file path`、`@path` 或 stdin `-` 传给命令行测试客户端，避免命令行长度和转义问题；三种入口都接受无 BOM 或带 UTF-8 BOM 的文件及中文路径：
 
 ```powershell
 Get-Content -Raw args.json | node tools\mixly_mcp_call.js mixly_build_project -
+```
+
+等价性审计单元测试：
+
+```powershell
+node tools\test_mixly_code_equivalence.js
 ```
 
 源码目录中的协议测试：
@@ -310,15 +399,45 @@ node tools\test_mixly_mcp_live_workflow.js
 node tools\test_mixly_local_mcp_package.js
 ```
 
+## 问题反馈
+
+提交问题前请先判断问题属于哪一层，避免同一个问题在多个仓库重复提交：
+
+- MCP 的板卡发现、积木扫描、规格读取、项目构建、真实验证、代码生成、编译调用或便携包问题：在本项目的 [GitHub Issues](../../issues/new/choose) 反馈。
+- Mixly 桌面程序、安装包、启动、页面导航或积木库导入管理器问题：在 [Mixly 打包版 Gitee Issues](https://gitee.com/mixly2/mixly2.0-win32-x64/issues) 反馈。
+- Mixly 官方板卡 XML、官方积木定义、生成器或板卡源码问题：在 [Mixly 源码 Gitee Issues](https://gitee.com/mixly2/mixly2.0_src/issues) 反馈。
+
+如果问题同时涉及 MCP 和 Mixly 本体，优先在最容易稳定复现的一侧提交，并在正文中附上另一侧问题链接。提交前先搜索已有 Issues；不要在 GitHub 和 Gitee 重复创建内容相同的问题。
+
+问题标题建议使用：
+
+```text
+[MCP 2.3.0][板卡 id@型号] 简短现象
+```
+
+问题正文至少包含：
+
+- MCP 版本、Mixly 版本、操作系统、Node.js 版本；涉及编译时再附 Arduino CLI 版本。
+- `MIXLY_HOME` 对应的是 Mixly 2 打包目录还是 Mixly 3 源码树。路径可脱敏，但请保留目录结构特征。
+- `mixly_get_board_profiles` 返回的板卡 id、具体型号和 FQBN；不要只写“ESP32”或“Nano”。
+- 出错的 MCP 工具名称、已脱敏的参数、最小复现步骤、期望结果和实际结果。
+- 可最小复现的 `.mix`、积木库 ZIP、源代码片段或工程树 JSON。大型工程请删去与问题无关的业务代码。
+- 完整错误文本和错误发生阶段，例如 `Download Timeout`、`EISDIR`、`Could not connect shadow block`、代码生成失败或 Arduino 编译失败。
+
+反馈前请删除 Wi-Fi 密码、访问令牌、私有仓库地址、个人路径、设备序列号及其他敏感信息。截图不是必需项；本 MCP 当前不提供识图能力，文字日志和最小复现文件通常更容易定位问题。
+
 ## 当前机器验证结果
 
 - 动态发现 21 个板卡入口，包含默认板卡和 `boards/extend` 扩展板。
 - 发现本机 AVR、ESP32 和 ESP8266 Arduino cores。
-- MCP 2.2.0 协议共 17 个工具；AVR 当前扫描到 529 个官方类型，并把官方和 `ThirdParty` 类型合并到 `availableBlockTypes`。
+- MCP 2.3.0 协议共 18 个工具；AVR 当前扫描到 529 个官方类型，并把官方和 `ThirdParty` 类型合并到 `availableBlockTypes`。
 - Mixly 3 ESP32 源码树扫描到 659 个运行时块定义、642 个运行时生成器、1 个主 bundle、5 个工具箱 XML 和 28 个官方示例工程；ESP-NOW 定义、生成器、默认 XML 和示例均可直接读取。
 - 后续新增的官方脚本和第三方库会在调用时重新扫描；命名、积木粒度、变量断链、孤立块、重叠和图片意图均只返回提示。
 - `Emakefun_tts20` 的完整标准目录以及 `handuan` 的语言包、媒体和 `FieldImage` 模式均被正确识别。
 - `treePath` 回归使用 240 个中文全局变量、480 个节点，自动连接为 1 条声明栈，没有命令行长度问题。
+- 结构树会在写入前校验 block 输入契约，`controls_if` 的 `elseif`/`else` mutation 可从分支自动推导；真实加载丢节点时返回具体块和父输入诊断。
+- UTF-8 BOM、中文参数文件和中文路径通过命令行调用回归；多目录 Arduino 库与指定 ThirdParty 库可隔离传给编译器。
+- 等价性审计覆盖 `report`、`behavioral-strict`、`exact` 及关键业务正则；它的测试结论只代表保守静态检查，不代表形式化等价证明。
 - 新版构建器生成的中文变量/中文函数/中文参数工程在真实 Blockly 中加载为 12 个节点，变量栈为 1、重叠为 0，并通过 Nano 编译。
 - LiftLight 工程真实加载为 369 个积木，其中 341 个官方块、28 个底层自定义块、9 个中文函数；其旧重复 ID 和重叠只返回警告。
 - 从积木生成代码后，Nano 新旧 Bootloader 在本机 Arduino CLI 上均编译通过。

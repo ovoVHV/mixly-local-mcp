@@ -5,12 +5,14 @@ const path = require('path');
 
 const toolsDir = __dirname;
 const root = path.resolve(toolsDir, '..');
-const outputPath = path.join(root, 'Mixly_Local_MCP_v2.2.0.zip');
+const outputPath = path.join(root, 'Mixly_Local_MCP_v2.3.0.zip');
 const packageRoot = 'MixlyLocalMCP';
 const yazl = require(path.join(toolsDir, 'node_modules', 'yazl'));
 
 const sources = [
   { source: path.join(toolsDir, 'mixly_mcp_server.js'), archive: 'mixly_mcp_server.js' },
+  { source: path.join(toolsDir, 'mixly_code_equivalence.js'), archive: 'mixly_code_equivalence.js' },
+  { source: path.join(toolsDir, 'test_mixly_code_equivalence.js'), archive: 'test_mixly_code_equivalence.js' },
   { source: path.join(toolsDir, 'validate_mixly_workspace.js'), archive: 'validate_mixly_workspace.js' },
   { source: path.join(toolsDir, 'mixly_mcp_call.js'), archive: 'mixly_mcp_call.js' },
   { source: path.join(toolsDir, 'package.json'), archive: 'package.json' },

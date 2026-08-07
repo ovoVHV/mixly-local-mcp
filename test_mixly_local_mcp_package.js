@@ -8,7 +8,7 @@ const readline = require('readline');
 const { spawn } = require('child_process');
 
 const root = path.resolve(__dirname, '..');
-const archivePath = path.join(root, 'Mixly_Local_MCP_v2.2.0.zip');
+const archivePath = path.join(root, 'Mixly_Local_MCP_v2.3.0.zip');
 const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mixly-local-mcp-package-'));
 const compressing = require(path.join(root, 'resources', 'app', 'node_modules', 'compressing'));
 const yauzl = require(path.join(root, 'resources', 'app', 'node_modules', 'yauzl'));
@@ -92,22 +92,53 @@ function callPackagedValidator(validatorPath) {
   });
 }
 
+function runPackagedScript(scriptPath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd: path.dirname(scriptPath),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`Packaged script failed: ${stderr || stdout}`));
+      resolve(stdout.trim());
+    });
+  });
+}
+
 async function main() {
   try {
     const entries = await zipEntries(archivePath);
     assert.equal(entries.filter((entry) => entry.endsWith('/')).length, 0);
     assert(entries.includes('MixlyLocalMCP/mixly_mcp_server.js'));
+    assert(entries.includes('MixlyLocalMCP/mixly_code_equivalence.js'));
+    assert(entries.includes('MixlyLocalMCP/test_mixly_code_equivalence.js'));
     assert(entries.includes('MixlyLocalMCP/node_modules/ws/index.js'));
     await compressing.zip.uncompress(archivePath, temporaryRoot, { zipFileNameEncoding: 'GBK' });
     const serverPath = path.join(temporaryRoot, 'MixlyLocalMCP', 'mixly_mcp_server.js');
+    const equivalenceTestPath = path.join(
+      temporaryRoot, 'MixlyLocalMCP', 'test_mixly_code_equivalence.js'
+    );
     const readme = fs.readFileSync(path.join(temporaryRoot, 'MixlyLocalMCP', 'README.md'), 'utf8');
     const packaged = await callPackagedServer(serverPath);
+    const equivalenceTest = await runPackagedScript(equivalenceTestPath);
     const validator = await callPackagedValidator(path.join(
       temporaryRoot, 'MixlyLocalMCP', 'validate_mixly_workspace.js'
     ));
-    assert.equal(packaged.initialization.serverInfo.version, '2.2.0');
-    assert.match(readme, /^# Mixly Local MCP 2\.2\.0/m);
+    assert.equal(packaged.initialization.serverInfo.version, '2.3.0');
+    assert.match(readme, /^# Mixly Local MCP 2\.3\.0/m);
     assert.match(readme, /mixly_get_board_profiles/);
+    assert.match(readme, /mixly_verify_equivalence/);
+    assert.match(readme, /behavioral-strict/);
+    assert.match(readme, /保守静态审计/);
+    assert.match(readme, /GitHub Issues/);
+    assert.match(readme, /gitee\.com\/mixly2\/mixly2\.0-win32-x64\/issues/);
+    assert.match(readme, /gitee\.com\/mixly2\/mixly2\.0_src\/issues/);
     assert.match(packaged.initialization.instructions, /官方目录和 libraries\/ThirdParty/);
     assert.match(packaged.initialization.instructions, /无需修改 MCP/);
     assert.equal(packaged.environment.mixlyRoot, root);
@@ -115,7 +146,25 @@ async function main() {
     assert(packaged.tools.some((tool) => tool.name === 'mixly_get_block_specs'));
     assert(packaged.tools.some((tool) => tool.name === 'mixly_get_board_profiles'));
     assert(packaged.tools.some((tool) => tool.name === 'mixly_build_project'));
+    assert(packaged.tools.some((tool) => tool.name === 'mixly_verify_equivalence'));
     assert(packaged.tools.some((tool) => tool.name === 'mixly_project_workflow'));
+    const equivalenceDefinition = packaged.tools.find(
+      (tool) => tool.name === 'mixly_verify_equivalence'
+    );
+    const workflowDefinition = packaged.tools.find(
+      (tool) => tool.name === 'mixly_project_workflow'
+    );
+    assert.deepEqual(equivalenceDefinition.inputSchema.properties.mode.enum, [
+      'report', 'behavioral-strict', 'exact'
+    ]);
+    assert.equal(equivalenceDefinition.inputSchema.properties.supportPaths.type, 'array');
+    assert.equal(equivalenceDefinition.inputSchema.properties.requiredPatterns.type, 'array');
+    assert.deepEqual(workflowDefinition.inputSchema.properties.equivalenceMode.enum, [
+      'report', 'behavioral-strict', 'exact'
+    ]);
+    assert.equal(workflowDefinition.inputSchema.properties.equivalenceSupportPaths.type, 'array');
+    assert.equal(workflowDefinition.inputSchema.properties.equivalenceRequiredPatterns.type, 'array');
+    assert.match(equivalenceTest, /equivalence audit passed/);
     assert.equal(validator.blockly, 'object');
     console.log(`Portable MCP package passed: ${entries.length} files / 0 directories`);
     console.log(`Packaged server detected ${packaged.environment.boards.length} installed board entries via MIXLY_HOME`);

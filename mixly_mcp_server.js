@@ -10,6 +10,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
+const { compareCode } = require('./mixly_code_equivalence');
 
 function looksLikeMixlyRoot(candidate) {
   if (!candidate) return false;
@@ -65,7 +66,7 @@ const toolDefinitions = [
   {
     name: 'mixly_get_block_specs',
     title: '读取积木真实接口',
-    description: '读取官方或 ThirdParty 积木的真实工具箱 XML、field/value/statement 名称、默认 shadow、连接类型、定义位置、生成器读取项和本地示例工程，帮助 AI 使用当前机器实际安装的积木。',
+    description: '读取官方或 ThirdParty 积木的真实工具箱 XML、field/value/statement 名称、默认 shadow、可留空输入及生成器回退值、连接类型、定义位置和本地示例工程，帮助 AI 使用当前机器实际安装的积木。',
     inputSchema: {
       type: 'object', required: ['board', 'blockTypes'],
       properties: {
@@ -128,6 +129,27 @@ const toolDefinitions = [
         sourceText: { type: 'string', description: '直接传入源码文本；与 sourcePath 二选一。' },
         language: { type: 'string', description: '可选语言提示；省略时自动判断。' },
         allowExternalPath: { type: 'boolean', description: '显式允许读取工作区外的 sourcePath，默认 false。' }
+      }
+    },
+    annotations: readOnly
+  },
+  {
+    name: 'mixly_verify_equivalence',
+    title: '审计生成代码与参考源码',
+    description: '对参考源码、积木生成代码及生成端辅助源码执行保守静态审计，报告遗漏的保护条件调用、提示文本、常量、副作用调用和必需正则。它不是形式化证明，也不替代真实 Blockly、编译或硬件测试。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourcePath: { type: 'string', description: '参考源码文件；与 sourceText 二选一。' },
+        sourceText: { type: 'string', description: '参考源码文本；与 sourcePath 二选一。' },
+        generatedPath: { type: 'string', description: '积木生成的代码文件；与 generatedText 二选一。' },
+        generatedText: { type: 'string', description: '积木生成的代码文本；与 generatedPath 二选一。' },
+        supportPaths: { type: 'array', items: { type: 'string' }, description: '生成端自定义 Arduino 库或其他辅助实现文件；会与 generatedPath/generatedText 一起审计。' },
+        mode: { type: 'string', enum: ['report', 'behavioral-strict', 'exact'], description: '默认 report；behavioral-strict 有缺口即失败，exact 比较去注释且忽略字符串外空白后的文本。' },
+        ignoreStrings: { type: 'array', items: { type: 'string' }, description: '已人工确认可忽略的参考源码字符串。' },
+        ignoreIdentifiers: { type: 'array', items: { type: 'string' }, description: '已人工确认可忽略的调用或常量名。' },
+        requiredPatterns: { type: 'array', items: {}, description: '生成端必须匹配的正则字符串，或 {label, pattern, flags} 对象。' },
+        allowExternalPath: { type: 'boolean', description: '显式允许读取 Mixly 工作区外的文件，默认 false。' }
       }
     },
     annotations: readOnly
@@ -311,11 +333,18 @@ const toolDefinitions = [
         profilePath: { type: 'string' },
         waitMs: { type: 'integer', minimum: 1000, maximum: 120000 },
         generator: { type: 'string' },
+        equivalenceMode: { type: 'string', enum: ['report', 'behavioral-strict', 'exact'], description: '传入参考源码时默认 report；严格交付可使用 behavioral-strict 或 exact。' },
+        equivalenceSupportPaths: { type: 'array', items: { type: 'string' }, description: '生成端自定义库或辅助实现源码文件。' },
+        equivalenceRequiredPatterns: { type: 'array', items: {}, description: '生成端必须保留的关键业务正则。' },
+        equivalenceIgnoreStrings: { type: 'array', items: { type: 'string' } },
+        equivalenceIgnoreIdentifiers: { type: 'array', items: { type: 'string' } },
         compile: { type: 'boolean', description: '为 true 时在生成后调用 arduino-cli。' },
         fqbn: { type: 'string' },
         fqbns: { type: 'array', items: { type: 'string' } },
         arduinoCliPath: { type: 'string' },
         librariesPath: { type: 'string' },
+        librariesPaths: { type: 'array', items: { type: 'string' }, description: '额外 Arduino 库目录列表；可与向后兼容的 librariesPath 同时使用。' },
+        mixlyLibraries: { type: 'array', items: { type: 'string' }, description: '当前板卡 ThirdParty 库名称；自动加入各库的 libraries 目录。' },
         compileTimeoutMs: { type: 'integer', minimum: 1000, maximum: 3600000 },
         keepBuild: { type: 'boolean' }
       }
@@ -333,7 +362,10 @@ const toolDefinitions = [
         fqbn: { type: 'string' },
         fqbns: { type: 'array', items: { type: 'string' }, description: '需要连续验证多个板卡配置时使用。' },
         arduinoCliPath: { type: 'string', description: 'AI 探测到的 arduino-cli 路径；省略时 MCP 从环境变量、Mixly 目录和 PATH 查找。' },
-        librariesPath: { type: 'string' },
+        librariesPath: { type: 'string', description: '单个 Arduino 库目录；为向后兼容保留。' },
+        librariesPaths: { type: 'array', items: { type: 'string' }, description: '多个 Arduino 库目录；与 librariesPath 合并、去重后逐个传给 arduino-cli。' },
+        board: { type: 'string', description: 'Mixly 板卡 id、boardType、profile 或 FQBN；与 mixlyLibraries 一起使用。' },
+        mixlyLibraries: { type: 'array', items: { type: 'string' }, description: 'Mixly ThirdParty 库名称；自动加入当前板卡 ThirdParty/<name>/libraries。' },
         allowExternalPath: { type: 'boolean', description: '显式允许工作区外 sketch/libraries 路径，默认 false。' },
         keepBuild: { type: 'boolean', description: '保留临时构建目录，默认 false。' },
         timeoutMs: { type: 'integer', minimum: 1000, maximum: 3600000, description: '单个 FQBN 的编译超时；默认 900000 毫秒，ESP32 首次构建可按需增加。' }
@@ -361,6 +393,10 @@ function ensureInsideWorkspace(filePath) {
 function resolveInputPath(filePath, allowExternalPath = false) {
   if (!filePath) fail('缺少文件路径');
   return allowExternalPath ? path.resolve(filePath) : ensureInsideWorkspace(filePath);
+}
+
+function stripUtf8Bom(text) {
+  return String(text).replace(/^\uFEFF/, '');
 }
 
 let boardCatalogCache = null;
@@ -828,6 +864,7 @@ function sourceLocation(files, blockType, kind, includeSource) {
     : [
         new RegExp(`forBlock(?:\\[['"]${escaped}['"]\\]|\\.${escaped})\\s*=`),
         new RegExp(`Blockly\\.(?:Arduino|Python|MicroPython)(?:\\[['"]${escaped}['"]\\]|\\.${escaped})\\s*=`),
+        new RegExp(`\\bregister\\(\\s*['"]${escaped}['"]\\s*,`),
         new RegExp(`\\bexport\\s+(?:const|let|var|function|class)\\s+${escaped}\\b`),
         new RegExp(`(?:^|[,{}])(?:['"]${escaped}['"]|${escaped})\\s*:\\s*\\(\\)\\s*=>`)
       ];
@@ -932,7 +969,23 @@ function sourceLocation(files, blockType, kind, includeSource) {
       if (resolved.symbol && resolved.symbol !== sourceSymbol) result.resolvedSymbol = resolved.symbol;
     }
     if (includeSource) result.excerpt = excerpt;
-    result.analysisSource = preciseSource || excerpt;
+    let analysisSource = preciseSource || excerpt;
+    if (kind === 'generator' && preciseSource) {
+      const helperSources = [];
+      const calledNames = unique([...preciseSource.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)]
+        .map((match) => match[1]));
+      for (const calledName of calledNames) {
+        const declaration = new RegExp(`\\bfunction\\s+${escapeRegExp(calledName)}\\s*\\([^)]*\\)\\s*\\{`).exec(source);
+        if (!declaration) continue;
+        const helperOpen = source.indexOf('{', declaration.index);
+        const helperClose = matchingBraceIndex(source, helperOpen);
+        if (helperClose <= helperOpen || helperClose - declaration.index > 10000) continue;
+        const helperSource = source.slice(declaration.index, helperClose + 1);
+        if (/valueToCode|statementToCode|getFieldValue/.test(helperSource)) helperSources.push(helperSource);
+      }
+      if (helperSources.length) analysisSource = `${helperSources.join('\n')}\n${analysisSource}`;
+    }
+    result.analysisSource = analysisSource;
     return result;
   }
   return null;
@@ -1063,6 +1116,45 @@ function callStringArguments(source, methodName, argumentIndex) {
   return unique(values);
 }
 
+function generatorValueDefaults(generatorSource) {
+  const source = String(generatorSource || '');
+  const defaults = new Map();
+  const fallbackPattern = String.raw`(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?|true|false|null)`;
+  const decodeFallback = (fallbackSource) => {
+    const value = String(fallbackSource).trim();
+    if (value.startsWith('"')) {
+      try { return JSON.parse(value); } catch (_) { return value.slice(1, -1); }
+    }
+    if (value.startsWith("'")) {
+      return value.slice(1, -1)
+        .replace(/\\'/g, "'")
+        .replace(/\\\\/g, '\\');
+    }
+    return value;
+  };
+  const record = (name, fallbackSource) => {
+    if (name && !defaults.has(name)) defaults.set(name, decodeFallback(fallbackSource));
+  };
+
+  const direct = new RegExp(
+    String.raw`valueToCode\(\s*[^,]+,\s*(['"])([^'"]+)\1\s*,[^)]*\)\s*\|\|\s*(${fallbackPattern})`,
+    'g'
+  );
+  for (const match of source.matchAll(direct)) record(match[2], match[3]);
+
+  const helperNames = unique([...source.matchAll(
+    /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{[^{}]{0,500}?valueToCode\([^)]*\)\s*\|\|\s*[A-Za-z_$][\w$]*[^{}]{0,100}?\}/g
+  )].map((match) => match[1]));
+  for (const helperName of helperNames) {
+    const helperCall = new RegExp(
+      String.raw`\b${escapeRegExp(helperName)}\s*\(\s*[^,()]+,\s*(['"])([^'"]+)\1\s*,\s*(${fallbackPattern})\s*\)`,
+      'g'
+    );
+    for (const match of source.matchAll(helperCall)) record(match[2], match[3]);
+  }
+  return defaults;
+}
+
 function contractFromSources(defaultXml, definitionSource, generatorSource) {
   const valueInputs = unique([
     ...directXmlNames(defaultXml, 'value', 'name'),
@@ -1085,8 +1177,13 @@ function contractFromSources(defaultXml, definitionSource, generatorSource) {
   else if (/setNextStatement\(\s*(?:true|!0)\b/.test(definitionSource || '')) connection = 'statement';
   else if (/setHat\(|MIXLY_SETUP/.test(definitionSource || '')) connection = 'hat';
   else if (statementInputs.length) connection = 'hat';
+  const valueDefaults = generatorValueDefaults(generatorSource);
   return {
     valueInputs,
+    optionalValueInputs: valueInputs.filter((name) => valueDefaults.has(name)),
+    valueDefaults: valueInputs
+      .filter((name) => valueDefaults.has(name))
+      .map((name) => ({ name, fallbackCode: valueDefaults.get(name) })),
     statementInputs,
     fieldNames,
     connection,
@@ -1103,6 +1200,83 @@ function readSource(args) {
     fail(`源码文件不存在: ${sourcePath}`);
   }
   return fs.readFileSync(sourcePath, 'utf8');
+}
+
+function equivalencePrimaryFile(args, textField, pathField, label, allowExternalPath) {
+  const hasText = args[textField] != null;
+  const hasPath = typeof args[pathField] === 'string' && args[pathField].trim().length > 0;
+  if (hasText === hasPath) fail(`${label}必须且只能提供 ${textField} 或 ${pathField} 其中一个`);
+  if (hasText) {
+    return { name: `<${textField}>`, text: stripUtf8Bom(String(args[textField])) };
+  }
+  const filePath = resolveInputPath(args[pathField], allowExternalPath);
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    fail(`${label}文件不存在或不是文件: ${filePath}`);
+  }
+  return { name: filePath, text: stripUtf8Bom(fs.readFileSync(filePath, 'utf8')) };
+}
+
+function equivalenceSupportFiles(supportPaths, allowExternalPath) {
+  const result = [];
+  const seen = new Set();
+  for (let index = 0; index < (supportPaths || []).length; index++) {
+    const filePath = resolveInputPath(supportPaths[index], allowExternalPath);
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      fail(`生成端辅助源码不存在或不是文件 (supportPaths[${index}]): ${filePath}`);
+    }
+    const key = process.platform === 'win32' ? filePath.toLowerCase() : filePath;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ name: filePath, text: stripUtf8Bom(fs.readFileSync(filePath, 'utf8')) });
+  }
+  return result;
+}
+
+function checkedRequiredPatterns(patterns) {
+  return (patterns || []).map((item, index) => {
+    const descriptor = typeof item === 'string' ? { label: item, pattern: item } : item;
+    if (!descriptor || typeof descriptor !== 'object' || typeof descriptor.pattern !== 'string' || !descriptor.pattern) {
+      fail(`requiredPatterns[${index}] 必须是非空正则字符串或 {label, pattern, flags} 对象`);
+    }
+    if (descriptor.label != null && typeof descriptor.label !== 'string') {
+      fail(`requiredPatterns[${index}].label 必须是字符串`);
+    }
+    if (descriptor.flags != null && typeof descriptor.flags !== 'string') {
+      fail(`requiredPatterns[${index}].flags 必须是字符串`);
+    }
+    try { new RegExp(descriptor.pattern, descriptor.flags || 'm'); } catch (error) {
+      fail(`requiredPatterns[${index}] 正则无效: ${error.message}`);
+    }
+    return descriptor;
+  });
+}
+
+function verifyEquivalence(args) {
+  const allowExternalPath = args.allowExternalPath === true;
+  const sourceFile = equivalencePrimaryFile(args, 'sourceText', 'sourcePath', '参考源码', allowExternalPath);
+  const generatedFile = equivalencePrimaryFile(args, 'generatedText', 'generatedPath', '生成代码', allowExternalPath);
+  const supportFiles = equivalenceSupportFiles(args.supportPaths, allowExternalPath);
+  const mode = args.mode || 'report';
+  const result = compareCode({
+    mode,
+    sourceFiles: [sourceFile],
+    generatedFiles: [generatedFile, ...supportFiles],
+    ignoreStrings: args.ignoreStrings || [],
+    ignoreIdentifiers: args.ignoreIdentifiers || [],
+    requiredPatterns: checkedRequiredPatterns(args.requiredPatterns)
+  });
+  return {
+    ...result,
+    blocking: mode !== 'report',
+    status: mode === 'report'
+      ? (result.behavioralGapCount ? 'gaps-found' : 'no-gaps-found')
+      : (result.passed ? 'passed' : 'failed'),
+    inputs: {
+      source: sourceFile.name,
+      generated: generatedFile.name,
+      support: supportFiles.map((file) => file.name)
+    }
+  };
 }
 
 function indexedScriptFiles(boardRoot, segment) {
@@ -1581,6 +1755,13 @@ function createLibrary(args) {
   if (/\bvoid\s+(?:setup|loop)\s*\(/.test(args.generatorsJs)) {
     warnings.push('生成器包含完整 setup() 或 loop()；建议优先用本地 setup/循环/函数积木组合');
   }
+  const variableFieldReads = [...args.generatorsJs.matchAll(/getFieldValue\(\s*['"]VAR['"]\s*\)/g)].length;
+  const escapedVariableReads = [...args.generatorsJs.matchAll(
+    /(?:variableDB_|nameDB_)\.getName\s*\(\s*[A-Za-z_$][\w$]*\.getFieldValue\(\s*['"]VAR['"]\s*\)/g
+  )].length;
+  if (variableFieldReads > escapedVariableReads) {
+    warnings.push(`生成器有 ${variableFieldReads - escapedVariableReads} 处直接读取 VAR；变量名必须通过 variableDB_.getName/nameDB_.getName 转成目标语言合法标识符，尤其要覆盖中文变量`);
+  }
 
   const blockTypes = extractBlockTypes(args.blocksJs);
   const generatorTypes = extractGeneratorTypes(args.generatorsJs);
@@ -1719,6 +1900,101 @@ function appendTreeNext(head, next) {
   return head;
 }
 
+function projectTreeNodeEntries(tree) {
+  const entries = [];
+  const seen = new Set();
+  let nextId = 0;
+
+  function visit(node, nodePath) {
+    if (!node || typeof node !== 'object' || seen.has(node)) return;
+    seen.add(node);
+    const diagnosticId = node.id || `mcp-${++nextId}`;
+    entries.push({ node, path: nodePath, id: diagnosticId });
+
+    for (const [name, connection] of Object.entries(node.values || {})) {
+      if (!connection || typeof connection !== 'object') continue;
+      if (connection.shadow) visit(connection.shadow, `${nodePath}.values.${name}.shadow`);
+      if (connection.block) visit(connection.block, `${nodePath}.values.${name}.block`);
+      if (!connection.shadow && !connection.block) visit(connection, `${nodePath}.values.${name}`);
+    }
+    for (const [name, connection] of Object.entries(node.statements || {})) {
+      if (!connection || typeof connection !== 'object') continue;
+      const hasBlockWrapper = Boolean(connection.block);
+      visit(connection.block || connection, `${nodePath}.statements.${name}${hasBlockWrapper ? '.block' : ''}`);
+    }
+    if (node.next && typeof node.next === 'object') {
+      const hasBlockWrapper = Boolean(node.next.block);
+      visit(node.next.block || node.next, `${nodePath}.next${hasBlockWrapper ? '.block' : ''}`);
+    }
+  }
+
+  for (let index = 0; index < (tree.blocks || []).length; index++) {
+    visit(tree.blocks[index], `blocks[${index}]`);
+  }
+  return entries;
+}
+
+function mutationAttribute(mutation, name) {
+  if (!mutation) return undefined;
+  if (typeof mutation === 'string') {
+    const tag = (mutation.match(/<mutation\b[^>]*>/i) || [])[0];
+    return tag ? markupAttributes(tag)[name] : undefined;
+  }
+  if (mutation.xml) {
+    const tag = (String(mutation.xml).match(/<mutation\b[^>]*>/i) || [])[0];
+    return tag ? markupAttributes(tag)[name] : undefined;
+  }
+  if (mutation[name] != null) return mutation[name];
+  return mutation.attributes && mutation.attributes[name];
+}
+
+function mutationXmlWithAttributes(source, attributes) {
+  return String(source).replace(/<mutation\b([^>]*?)(\/?)>/i, (tag, body, selfClosing) => {
+    let updated = body;
+    for (const [name, value] of Object.entries(attributes)) {
+      const pattern = new RegExp(`\\s+${escapeRegExp(name)}\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+)`, 'i');
+      updated = updated.replace(pattern, '');
+      updated += ` ${name}="${xmlEscape(value)}"`;
+    }
+    return `<mutation${updated}${selfClosing}>`;
+  });
+}
+
+function inferControlsIfMutation(node) {
+  if (!node || node.type !== 'controls_if') return;
+  const connectionNames = [
+    ...Object.keys(node.values || {}),
+    ...Object.keys(node.statements || {})
+  ];
+  const branchIndexes = connectionNames
+    .map((name) => /^(?:IF|DO)(\d+)$/.exec(name))
+    .filter(Boolean)
+    .map((match) => Number(match[1]));
+  const inferredElseIf = branchIndexes.length ? Math.max(...branchIndexes) : 0;
+  const hasElse = Object.prototype.hasOwnProperty.call(node.statements || {}, 'ELSE');
+  if (!inferredElseIf && !hasElse) return;
+
+  const attributes = {};
+  if (inferredElseIf) {
+    const existing = Number(mutationAttribute(node.mutation, 'elseif')) || 0;
+    attributes.elseif = Math.max(existing, inferredElseIf);
+  }
+  if (hasElse) attributes.else = 1;
+
+  if (typeof node.mutation === 'string') {
+    node.mutation = /<mutation\b/i.test(node.mutation)
+      ? mutationXmlWithAttributes(node.mutation, attributes)
+      : { attributes };
+  } else if (node.mutation && node.mutation.xml) {
+    node.mutation = {
+      ...node.mutation,
+      xml: mutationXmlWithAttributes(node.mutation.xml, attributes)
+    };
+  } else {
+    node.mutation = { ...(node.mutation || {}), ...attributes };
+  }
+}
+
 function normalizeProjectTree(tree) {
   if (!tree || typeof tree !== 'object' || Array.isArray(tree)) fail('工程树必须是 JSON 对象');
   const cloned = JSON.parse(JSON.stringify(tree));
@@ -1755,6 +2031,7 @@ function normalizeProjectTree(tree) {
   }
   cloned.blocks = blocks;
   delete cloned.topBlocks;
+  for (const { node } of projectTreeNodeEntries(cloned)) inferControlsIfMutation(node);
   return cloned;
 }
 
@@ -1860,6 +2137,9 @@ function parseProjectXml(projectXml) {
     if (!name) continue;
     const attributes = xmlAttributes(token);
     const parentBlock = [...stack].reverse().find((entry) => entry.block)?.block || null;
+    const parentConnectionEntry = [...stack].reverse().find((entry) =>
+      entry.name === 'value' || entry.name === 'statement' || entry.name === 'next'
+    );
     let block = null;
     if (name === 'block' || name === 'shadow') {
       block = {
@@ -1869,6 +2149,10 @@ function parseProjectXml(projectXml) {
         x: attributes.x == null ? null : Number(attributes.x),
         y: attributes.y == null ? null : Number(attributes.y),
         parent: parentBlock,
+        parentConnection: parentBlock && parentConnectionEntry ? {
+          kind: parentConnectionEntry.name,
+          name: parentConnectionEntry.attributes.name || null
+        } : null,
         fields: {},
         mutation: null,
         args: []
@@ -2039,12 +2323,98 @@ function saveProject(args) {
   return { projectPath, ...report };
 }
 
+function validateProjectTreeConnections(tree, boardSelector) {
+  const entries = projectTreeNodeEntries(tree);
+  const requestedTypes = unique(entries.map(({ node }) => node.type).filter(Boolean));
+  const specs = [];
+  for (let index = 0; index < requestedTypes.length; index += 50) {
+    specs.push(...getBlockSpecs({
+      board: boardSelector,
+      blockTypes: requestedTypes.slice(index, index + 50),
+      includeSource: false
+    }).specs);
+  }
+  const reliableSpecs = new Map(specs
+    .filter((spec) => spec.definition && !spec.contract.hasMutation)
+    .map((spec) => [spec.type, spec]));
+  const skippedDynamicTypes = unique(specs
+    .filter((spec) => spec.contract.hasMutation)
+    .map((spec) => spec.type)).sort();
+  const unresolvedTypes = requestedTypes.filter((type) => !reliableSpecs.has(type) && !skippedDynamicTypes.includes(type)).sort();
+  const checkedTypes = new Set(reliableSpecs.keys());
+  const invalidNodes = [];
+  let checkedNodes = 0;
+
+  for (const entry of entries) {
+    const spec = reliableSpecs.get(entry.node.type);
+    let owner;
+    let legalNames;
+    if (spec) {
+      owner = spec.owner;
+      legalNames = {
+        fields: spec.contract.fieldNames,
+        values: spec.contract.valueInputs,
+        statements: spec.contract.statementInputs
+      };
+    } else if (entry.node.type === 'controls_if') {
+      const elseIfCount = Math.max(0, Number(mutationAttribute(entry.node.mutation, 'elseif')) || 0);
+      const hasElse = /^(?:1|true)$/i.test(String(mutationAttribute(entry.node.mutation, 'else') || ''));
+      owner = 'official/dynamic-aware';
+      legalNames = {
+        fields: [],
+        values: Array.from({ length: elseIfCount + 1 }, (_, index) => `IF${index}`),
+        statements: [
+          ...Array.from({ length: elseIfCount + 1 }, (_, index) => `DO${index}`),
+          ...(hasElse ? ['ELSE'] : [])
+        ]
+      };
+      checkedTypes.add(entry.node.type);
+    } else {
+      continue;
+    }
+    checkedNodes++;
+    const suppliedNames = {
+      fields: Object.keys(entry.node.fields || {}),
+      values: Object.keys(entry.node.values || {}),
+      statements: Object.keys(entry.node.statements || {})
+    };
+    const invalidNames = {
+      fields: suppliedNames.fields.filter((name) => !legalNames.fields.includes(name)),
+      values: suppliedNames.values.filter((name) => !legalNames.values.includes(name)),
+      statements: suppliedNames.statements.filter((name) => !legalNames.statements.includes(name))
+    };
+    if (!invalidNames.fields.length && !invalidNames.values.length && !invalidNames.statements.length) continue;
+    invalidNodes.push({
+      node: { type: entry.node.type, id: entry.id, path: entry.path },
+      owner,
+      invalidNames,
+      legalNames
+    });
+  }
+
+  if (invalidNodes.length) {
+    fail('结构化积木树包含无效的积木连接名', {
+      invalidNodes,
+      checkedTypes: [...checkedTypes].sort(),
+      skippedDynamicTypes,
+      unresolvedTypes,
+      writePrevented: true
+    });
+  }
+  return {
+    checkedNodes,
+    checkedTypes: [...checkedTypes].sort(),
+    skippedDynamicTypes,
+    unresolvedTypes
+  };
+}
+
 function buildProject(args) {
   let tree = args.tree;
   if (args.treePath) {
     const treePath = ensureInsideWorkspace(args.treePath);
     if (!fs.existsSync(treePath) || !fs.statSync(treePath).isFile()) fail(`工程树文件不存在: ${treePath}`);
-    try { tree = JSON.parse(fs.readFileSync(treePath, 'utf8')); } catch (error) { fail(`工程树 JSON 无效: ${error.message}`); }
+    try { tree = JSON.parse(stripUtf8Bom(fs.readFileSync(treePath, 'utf8'))); } catch (error) { fail(`工程树 JSON 无效: ${error.message}`); }
   }
   if (!tree) fail('需要 treePath 或 tree');
   const normalized = normalizeProjectTree(tree);
@@ -2054,6 +2424,7 @@ function buildProject(args) {
       ? `${board.boardType}@${board.selectedProfile}`
       : board.boardType;
   }
+  const treeContractValidation = validateProjectTreeConnections(normalized, args.board);
   const serialized = serializeProjectTree(normalized);
   const report = projectCompatibility(args, serialized.xml);
   if (!report.passed) fail('结构化积木工程兼容性检查失败', { ...report, parsed: undefined });
@@ -2065,6 +2436,7 @@ function buildProject(args) {
     serializedNodes: serialized.nodeCount,
     autoLayout: true,
     globalVariablesChained: true,
+    treeContractValidation,
     ...report
   };
 }
@@ -2332,6 +2704,47 @@ function loadProjectExpression(projectPath, body) {
   return `(()=>{const fs=Mixly.require('fs');const source=fs.readFileSync(${encodedPath},'utf8');const dom=Blockly.utils.xml.textToDom(source);const workspace=Blockly.getMainWorkspace();Blockly.Xml.clearWorkspaceAndLoadFromXml(dom,workspace);${body}})()`;
 }
 
+function projectLoadDiagnostics(parsed, liveBlocks) {
+  const inventory = Array.isArray(liveBlocks) ? liveBlocks : [];
+  const loadedById = new Map(inventory.filter((block) => block.id).map((block) => [block.id, block]));
+  const expectedById = new Map(parsed.blocks.filter((block) => block.id).map((block) => [block.id, block]));
+  const missingBlocks = parsed.blocks.filter((block) => block.id && !loadedById.has(block.id)).map((block) => {
+    let ancestor = block.parent;
+    while (ancestor && (!ancestor.id || !loadedById.has(ancestor.id))) ancestor = ancestor.parent;
+    return {
+      id: block.id,
+      type: block.type,
+      parent: block.parent ? { id: block.parent.id || null, type: block.parent.type } : null,
+      parentConnection: block.parentConnection || null,
+      nearestLoadedAncestor: ancestor ? { id: ancestor.id || null, type: ancestor.type } : null
+    };
+  });
+  const unexpectedBlocks = inventory.filter((block) => block.id && !expectedById.has(block.id));
+  const mismatchedBlocks = inventory.filter((block) => {
+    const expected = block.id && expectedById.get(block.id);
+    return expected && expected.type !== block.type;
+  }).map((block) => ({
+    id: block.id,
+    expectedType: expectedById.get(block.id).type,
+    loadedType: block.type,
+    loadedParent: block.parent || null
+  }));
+  const countTypes = (blocks) => {
+    const counts = new Map();
+    for (const block of blocks) counts.set(block.type, (counts.get(block.type) || 0) + 1);
+    return counts;
+  };
+  const expectedTypes = countTypes(parsed.blocks);
+  const loadedTypes = countTypes(inventory);
+  const missingTypes = [...expectedTypes.entries()].map(([type, expected]) => ({
+    type,
+    expected,
+    loaded: loadedTypes.get(type) || 0,
+    missing: expected - (loadedTypes.get(type) || 0)
+  })).filter((item) => item.missing > 0).sort((left, right) => right.missing - left.missing || left.type.localeCompare(right.type));
+  return { missingBlocks, missingTypes, mismatchedBlocks, unexpectedBlocks };
+}
+
 async function validateProject(args) {
   const projectPath = ensureInsideWorkspace(args.projectPath);
   if (!fs.existsSync(projectPath)) fail(`Mixly 工程不存在: ${projectPath}`);
@@ -2340,7 +2753,7 @@ async function validateProject(args) {
   const staticReport = projectCompatibility(args, projectXml);
   if (!staticReport.passed) fail('Mixly 工程静态兼容性检查失败', { ...staticReport, parsed: undefined });
   const expression = loadProjectExpression(projectPath,
-    `workspace.zoomToFit();const blocks=workspace.getAllBlocks(false);const top=workspace.getTopBlocks(false);const prefixes=${JSON.stringify(prefixes)};const custom=blocks.filter((block)=>prefixes.some((prefix)=>block.type.startsWith(prefix)));const rects=top.map((block)=>{const p=block.getRelativeToSurfaceXY();const s=block.getHeightWidth();return{id:block.id,type:block.type,x:p.x,y:p.y,width:s.width,height:s.height};});const overlaps=[];for(let i=0;i<rects.length;i++){for(let j=i+1;j<rects.length;j++){const a=rects[i],b=rects[j];if(a.x<b.x+b.width&&a.x+a.width>b.x&&a.y<b.y+b.height&&a.y+a.height>b.y)overlaps.push([a.id,b.id]);}}const orphanValues=top.filter((block)=>block.outputConnection).map((block)=>({id:block.id,type:block.type}));const topVariables=top.filter((block)=>block.type==='variables_declare').map((block)=>block.id);return JSON.stringify({ready:document.readyState,title:document.title,board:Mixly.Boards.getSelectedBoardName(),totalNodes:blocks.length,nativeNodes:blocks.length-custom.length,customNodes:custom.length,customTypes:[...new Set(custom.map((block)=>block.type))].sort(),procedures:blocks.filter((block)=>block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn').map((block)=>block.getFieldValue('NAME')).sort(),chineseProcedures:blocks.filter((block)=>(block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn')&&/[\\u3400-\\u9fff]/.test(block.getFieldValue('NAME')||'')).map((block)=>block.getFieldValue('NAME')).sort(),thirdPartyXmlCount:(Mixly.Env.thirdPartyXML||[]).length,scale:workspace.scale,topLevelBlocks:top.length,topVariableDeclarationStacks:topVariables.length,orphanValues,rects,overlaps});`
+    `workspace.zoomToFit();const blocks=workspace.getAllBlocks(false);const top=workspace.getTopBlocks(false);const prefixes=${JSON.stringify(prefixes)};const custom=blocks.filter((block)=>prefixes.some((prefix)=>block.type.startsWith(prefix)));const rects=top.map((block)=>{const p=block.getRelativeToSurfaceXY();const s=block.getHeightWidth();return{id:block.id,type:block.type,x:p.x,y:p.y,width:s.width,height:s.height};});const overlaps=[];for(let i=0;i<rects.length;i++){for(let j=i+1;j<rects.length;j++){const a=rects[i],b=rects[j];if(a.x<b.x+b.width&&a.x+a.width>b.x&&a.y<b.y+b.height&&a.y+a.height>b.y)overlaps.push([a.id,b.id]);}}const orphanValues=top.filter((block)=>block.outputConnection).map((block)=>({id:block.id,type:block.type}));const topVariables=top.filter((block)=>block.type==='variables_declare').map((block)=>block.id);const blockInventory=blocks.map((block)=>{const parent=block.getParent();return{id:block.id,type:block.type,parent:parent?{id:parent.id,type:parent.type}:null};});return JSON.stringify({ready:document.readyState,title:document.title,board:Mixly.Boards.getSelectedBoardName(),totalNodes:blocks.length,nativeNodes:blocks.length-custom.length,customNodes:custom.length,customTypes:[...new Set(custom.map((block)=>block.type))].sort(),procedures:blocks.filter((block)=>block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn').map((block)=>block.getFieldValue('NAME')).sort(),chineseProcedures:blocks.filter((block)=>(block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn')&&/[\\u3400-\\u9fff]/.test(block.getFieldValue('NAME')||'')).map((block)=>block.getFieldValue('NAME')).sort(),thirdPartyXmlCount:(Mixly.Env.thirdPartyXML||[]).length,scale:workspace.scale,topLevelBlocks:top.length,topVariableDeclarationStacks:topVariables.length,orphanValues,rects,overlaps,blockInventory});`
   );
   const evaluated = await evaluateCdp(expression, getCdpPort(args));
   if (!evaluated.value || typeof evaluated.value !== 'object') {
@@ -2348,6 +2761,7 @@ async function validateProject(args) {
   }
   const liveErrors = [];
   const liveWarnings = [];
+  const loadDiagnostics = projectLoadDiagnostics(staticReport.parsed, evaluated.value.blockInventory);
   if (evaluated.value.totalNodes !== staticReport.totalNodes) {
     liveErrors.push(`XML 有 ${staticReport.totalNodes} 个节点，真实 Blockly 只加载 ${evaluated.value.totalNodes} 个`);
   }
@@ -2355,12 +2769,17 @@ async function validateProject(args) {
   if (evaluated.value.orphanValues.length) liveWarnings.push('存在孤立的值积木，建议连接或删除');
   if (evaluated.value.overlaps.length) liveWarnings.push('顶层积木布局发生重叠，建议重新排布');
   if (liveErrors.length) {
+    const liveResult = { ...evaluated.value };
+    delete liveResult.blockInventory;
     fail('Mixly 真实工作区兼容性检查失败', {
       liveErrors,
       expectedNodes: staticReport.totalNodes,
-      ...evaluated.value
+      loadedNodes: evaluated.value.totalNodes,
+      ...loadDiagnostics,
+      ...liveResult
     });
   }
+  delete evaluated.value.blockInventory;
   delete staticReport.parsed;
   return {
     projectPath,
@@ -2393,6 +2812,10 @@ async function projectWorkflow(args) {
   const board = getBoard(args.board);
   const boardSelector = board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id;
   const projectPath = ensureInsideWorkspace(args.projectPath);
+  const hasReferenceSource = args.sourceText != null || Boolean(args.sourcePath);
+  if (args.equivalenceMode && !hasReferenceSource) {
+    fail('使用 equivalenceMode 时必须同时传入 sourcePath 或 sourceText');
+  }
   const build = buildProject(args);
   const launched = await launchMixly(args);
   const opened = await openProject({
@@ -2420,6 +2843,23 @@ async function projectWorkflow(args) {
     generator: args.generator,
     cdpPort: getCdpPort(args)
   });
+  let equivalence = null;
+  if (hasReferenceSource) {
+    equivalence = verifyEquivalence({
+      sourcePath: args.sourceText != null ? undefined : args.sourcePath,
+      sourceText: args.sourceText,
+      generatedPath: outputPath,
+      supportPaths: args.equivalenceSupportPaths,
+      mode: args.equivalenceMode || 'report',
+      requiredPatterns: args.equivalenceRequiredPatterns,
+      ignoreStrings: args.equivalenceIgnoreStrings,
+      ignoreIdentifiers: args.equivalenceIgnoreIdentifiers,
+      allowExternalPath: args.allowExternalSourcePath === true
+    });
+    if (equivalence.passed === false) {
+      fail('Mixly 生成代码未通过源码等价性审计', { equivalence });
+    }
+  }
   let compiled = null;
   if (args.compile === true) {
     compiled = await compileSketch({
@@ -2428,6 +2868,9 @@ async function projectWorkflow(args) {
       fqbns: args.fqbns,
       arduinoCliPath: args.arduinoCliPath,
       librariesPath: args.librariesPath,
+      librariesPaths: args.librariesPaths,
+      board: boardSelector,
+      mixlyLibraries: args.mixlyLibraries,
       allowExternalPath: false,
       keepBuild: args.keepBuild,
       timeoutMs: args.compileTimeoutMs
@@ -2440,7 +2883,7 @@ async function projectWorkflow(args) {
     fqbn: board.fqbn || null,
     projectPath,
     outputPath,
-    stages: { build, launched, opened, validated, generated, compiled }
+    stages: { build, launched, opened, validated, generated, equivalence, compiled }
   };
 }
 
@@ -2572,9 +3015,124 @@ async function detectEnvironment(args) {
 function compileMetrics(text) {
   const flash = text.match(/Sketch uses\s+([\d,]+) bytes.*?Maximum is\s+([\d,]+) bytes/i);
   const sram = text.match(/Global variables use\s+([\d,]+) bytes.*?maximum is\s+([\d,]+) bytes/i);
+  const metric = (match) => {
+    if (!match) return null;
+    const used = Number(match[1].replace(/,/g, ''));
+    const maximum = Number(match[2].replace(/,/g, ''));
+    return {
+      used,
+      maximum,
+      percent: maximum > 0 ? Number(((used / maximum) * 100).toFixed(1)) : null
+    };
+  };
   return {
-    flash: flash ? { used: Number(flash[1].replace(/,/g, '')), maximum: Number(flash[2].replace(/,/g, '')) } : null,
-    sram: sram ? { used: Number(sram[1].replace(/,/g, '')), maximum: Number(sram[2].replace(/,/g, '')) } : null
+    flash: metric(flash),
+    sram: metric(sram)
+  };
+}
+
+function compileResourceRisk(metrics) {
+  const warnings = [];
+  let level = 'normal';
+  const inspect = (name, metric, warningAt, highAt, explanation) => {
+    if (!metric || metric.percent == null) return;
+    if (metric.percent >= highAt) {
+      level = 'high';
+      warnings.push(`${name} 使用率 ${metric.percent}%（${metric.used}/${metric.maximum} bytes），${explanation}`);
+    } else if (metric.percent >= warningAt) {
+      if (level !== 'high') level = 'warning';
+      warnings.push(`${name} 使用率 ${metric.percent}%（${metric.used}/${metric.maximum} bytes），余量偏低`);
+    }
+  };
+  inspect('Flash', metrics.flash, 80, 90, '已接近程序存储上限');
+  inspect('SRAM', metrics.sram, 70, 80, '静态占用较高，运行期栈、堆和库缓冲区仍会继续使用内存');
+  if (!metrics.flash && !metrics.sram) level = 'unknown';
+  return { level, warnings };
+}
+
+function resolveCompileLibraryPaths(args, allowExternal) {
+  const explicitInputs = [
+    ...(args.librariesPath ? [{ value: args.librariesPath, field: 'librariesPath' }] : []),
+    ...(Array.isArray(args.librariesPaths)
+      ? args.librariesPaths.map((value, index) => ({ value, field: `librariesPaths[${index}]` }))
+      : [])
+  ];
+  const explicitPaths = explicitInputs.map(({ value, field }) => {
+    if (!String(value).trim()) fail(`参数 ${field} 不能为空`);
+    const resolved = resolveInputPath(value, allowExternal);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+      fail(`Arduino 库目录不存在或不是目录 (${field}): ${resolved}`);
+    }
+    return resolved;
+  });
+
+  const requestedMixlyLibraries = [];
+  const requestedNames = new Set();
+  for (const name of Array.isArray(args.mixlyLibraries) ? args.mixlyLibraries : []) {
+    const key = name.toLowerCase();
+    if (requestedNames.has(key)) continue;
+    requestedNames.add(key);
+    requestedMixlyLibraries.push(name);
+  }
+  if (requestedMixlyLibraries.length && !args.board) {
+    fail('使用 mixlyLibraries 时必须同时传入 board');
+  }
+  const resolvedMixlyLibraries = [];
+  let mixlyBoard = null;
+  if (requestedMixlyLibraries.length) {
+    const board = getBoard(args.board);
+    mixlyBoard = board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id;
+    const thirdPartyRoot = path.join(board.root, 'libraries', 'ThirdParty');
+    const availableLibraries = fs.existsSync(thirdPartyRoot)
+      ? fs.readdirSync(thirdPartyRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+      : [];
+    for (const requestedName of requestedMixlyLibraries) {
+      if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(requestedName)) {
+        fail(`Mixly 库名称格式不正确: ${requestedName}`);
+      }
+      const name = availableLibraries.find((candidate) =>
+        candidate.toLowerCase() === requestedName.toLowerCase()
+      );
+      if (!name) {
+        fail(`当前板卡未安装 Mixly ThirdParty 库: ${requestedName}`, {
+          board: board.id,
+          availableMixlyLibraries: availableLibraries.sort()
+        });
+      }
+      const libraryPath = path.join(thirdPartyRoot, name, 'libraries');
+      if (!fs.existsSync(libraryPath) || !fs.statSync(libraryPath).isDirectory()) {
+        fail(`Mixly ThirdParty 库没有 Arduino libraries 目录: ${libraryPath}`);
+      }
+      resolvedMixlyLibraries.push({ name, path: libraryPath });
+    }
+  }
+
+  let defaultPath = null;
+  if (explicitInputs.length === 0 && fs.existsSync(DEFAULT_LIB_ROOT)) {
+    if (!fs.statSync(DEFAULT_LIB_ROOT).isDirectory()) {
+      fail(`默认 Arduino 库路径不是目录: ${DEFAULT_LIB_ROOT}`);
+    }
+    defaultPath = DEFAULT_LIB_ROOT;
+  }
+  const allPaths = [
+    ...(defaultPath ? [defaultPath] : []),
+    ...explicitPaths,
+    ...resolvedMixlyLibraries.map((library) => library.path)
+  ];
+  const pathKeys = new Set();
+  const librariesPaths = allPaths.filter((libraryPath) => {
+    const key = process.platform === 'win32' ? libraryPath.toLowerCase() : libraryPath;
+    if (pathKeys.has(key)) return false;
+    pathKeys.add(key);
+    return true;
+  });
+  return {
+    librariesPath: librariesPaths[0] || null,
+    librariesPaths,
+    mixlyBoard,
+    mixlyLibraryPaths: resolvedMixlyLibraries
   };
 }
 
@@ -2582,12 +3140,7 @@ async function compileSketch(args) {
   const allowExternal = args.allowExternalPath === true;
   const sketchPath = resolveInputPath(args.sketchPath, allowExternal);
   if (!fs.existsSync(sketchPath)) fail(`Arduino 工程不存在: ${sketchPath}`);
-  const librariesPath = args.librariesPath
-    ? resolveInputPath(args.librariesPath, allowExternal)
-    : (fs.existsSync(DEFAULT_LIB_ROOT) ? DEFAULT_LIB_ROOT : null);
-  if (librariesPath && (!fs.existsSync(librariesPath) || !fs.statSync(librariesPath).isDirectory())) {
-    fail(`Arduino 库目录不存在或不是目录: ${librariesPath}`);
-  }
+  const libraryResolution = resolveCompileLibraryPaths(args, allowExternal);
   const arduinoCli = findArduinoCli(args.arduinoCliPath);
   if (!arduinoCli) {
     fail('找不到 arduino-cli；请先调用 mixly_detect_environment，或显式传 arduinoCliPath');
@@ -2605,18 +3158,22 @@ async function compileSketch(args) {
       let result;
       try {
         const compileArgs = ['compile', '--fqbn', fqbn];
-        if (librariesPath) compileArgs.push('--libraries', librariesPath);
+        for (const librariesPath of libraryResolution.librariesPaths) {
+          compileArgs.push('--libraries', librariesPath);
+        }
         compileArgs.push('--build-path', buildPath, staged.sketchPath);
         result = await runCommand(arduinoCli, compileArgs, { timeoutMs });
       } finally {
         if (args.keepBuild !== true) fs.rmSync(buildPath, { recursive: true, force: true });
       }
       const diagnostics = `${result.stdout}\n${result.stderr}`.trim();
+      const metrics = compileMetrics(diagnostics);
       results.push({
         fqbn,
         code: result.code,
         timedOut: result.timedOut,
-        metrics: compileMetrics(diagnostics),
+        metrics,
+        resourceRisk: compileResourceRisk(metrics),
         diagnostics: diagnostics.length > 30000 ? diagnostics.slice(-30000) : diagnostics,
         buildPath: args.keepBuild === true ? buildPath : null
       });
@@ -2624,14 +3181,24 @@ async function compileSketch(args) {
   } finally {
     if (staged.cleanup) staged.cleanup();
   }
+  const riskRank = { unknown: 0, normal: 1, warning: 2, high: 3 };
+  const highestRisk = results.reduce((current, item) =>
+    riskRank[item.resourceRisk.level] > riskRank[current] ? item.resourceRisk.level : current, 'unknown');
   return {
     sketchPath,
     cliSketchPath: staged.sketchPath,
     staged: staged.staged,
     arduinoCli,
-    librariesPath,
+    librariesPath: libraryResolution.librariesPath,
+    librariesPaths: libraryResolution.librariesPaths,
+    mixlyBoard: libraryResolution.mixlyBoard,
+    mixlyLibraryPaths: libraryResolution.mixlyLibraryPaths,
     timeoutMs,
     results,
+    resourceRisk: {
+      level: highestRisk,
+      warnings: results.flatMap((item) => item.resourceRisk.warnings.map((message) => ({ fqbn: item.fqbn, message })))
+    },
     passed: results.every((item) => item.code === 0 && !item.timedOut)
   };
 }
@@ -2685,6 +3252,7 @@ async function callTool(name, rawArgs = {}) {
     case 'mixly_detect_environment': return detectEnvironment(args);
     case 'mixly_get_board_profiles': return getBoardProfiles(args);
     case 'mixly_analyze_source': return analyzeSource(args);
+    case 'mixly_verify_equivalence': return verifyEquivalence(args);
     case 'mixly_create_library': return createLibrary(args);
     case 'mixly_build_project': return buildProject(args);
     case 'mixly_save_project': return saveProject(args);
@@ -2719,8 +3287,8 @@ function handleMessage(message) {
       result: {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
-         serverInfo: { name: 'mixly-local-builder', version: '2.2.0' },
-        instructions: '所有规则以提示和帮助复用为主，不因风格选择阻止 AI。建议先用 mixly_detect_environment 探测环境，并用 mixly_get_board_profiles 从本机元数据选择真实型号、FQBN 和配置项；不要固定任一板卡。分析源码后，再用 mixly_scan_library 动态扫描目标板当前安装的全部积木；availableBlockTypes 同时包含板卡官方目录和 libraries/ThirdParty，第三方积木也是可优先复用的本地积木。遇到不熟悉的 type，可调用 mixly_get_block_specs 读取本机真实 defaultXml、字段、输入、shadow 和生成器接口，不要凭名称猜结构；新安装或后续增加的积木会自动进入扫描结果，无需修改 MCP。mixly_inspect_library 可查看第三方库目录、语言、媒体、图片字段和 Arduino libraries。变量、函数、判断、循环、数学、时间及硬件操作尽量保持为可见积木；粒度过大只返回 warning。中文名称按用户偏好处理：只修改 variables_* 的 VAR、procedure 的 NAME、mutation name/arg name，声明与引用保持一致，官方 type 和输入名不要翻译。图片使用与用户要求不一致时只提示。大型工程建议通过 treePath 调用 mixly_build_project，避免命令行长度问题并自动连接变量栈、安排布局。最后建议真实打开、验证、生成代码并编译；只有无效 XML、未安装 block type、定义/生成器缺失、真实 Blockly 节点丢失或编译失败等确定不可用问题才报错，命名、粒度、变量断链、孤立块和重叠都作为 warnings 返回。'
+        serverInfo: { name: 'mixly-local-builder', version: '2.3.0' },
+        instructions: '所有规则以提示和帮助复用为主，不因风格选择阻止 AI。建议先用 mixly_detect_environment 探测环境，并用 mixly_get_board_profiles 从本机元数据选择真实型号、FQBN 和配置项；不要固定任一板卡。分析源码后，再用 mixly_scan_library 动态扫描目标板当前安装的全部积木；availableBlockTypes 同时包含板卡官方目录和 libraries/ThirdParty，第三方积木也是可优先复用的本地积木。遇到不熟悉的 type，可调用 mixly_get_block_specs 读取本机真实 defaultXml、字段、输入、shadow 和生成器接口，不要凭名称猜结构；新安装或后续增加的积木会自动进入扫描结果，无需修改 MCP。mixly_inspect_library 可查看第三方库目录、语言、媒体、图片字段和 Arduino libraries。变量、函数、判断、循环、数学、时间及硬件操作尽量保持为可见积木；粒度过大只返回 warning。中文名称按用户偏好处理：只修改 variables_* 的 VAR、procedure 的 NAME、mutation name/arg name，声明与引用保持一致，官方 type 和输入名不要翻译。图片使用与用户要求不一致时只提示。大型工程建议通过 treePath 调用 mixly_build_project；构建器会连接变量栈、安排布局、推导 controls_if mutation，并在写入前检查本机可可靠解析的官方与 ThirdParty 块输入契约。最后必须真实打开、验证和生成代码；有参考源码时用 mixly_verify_equivalence 检查明显行为遗漏，要求严格交付时使用 behavioral-strict 或 exact。Arduino 编译可隔离传入多个库目录，结果中的 Flash/SRAM 风险不能因编译成功而忽略。只有无效 XML、未安装 block type、定义/生成器缺失、真实 Blockly 节点丢失、严格等价审计失败或编译失败等确定不可用问题才报错，命名、粒度、变量断链、孤立块和重叠都作为 warnings 返回。'
       }
     });
     return;
@@ -2763,13 +3331,21 @@ function handleMessage(message) {
   }
 }
 
-const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-input.on('line', (line) => {
-  if (!line.trim()) return;
-  try {
-    handleMessage(JSON.parse(line));
-  } catch (error) {
-    send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: `Parse error: ${error.message}` } });
-  }
-});
-input.on('close', () => process.exit(0));
+function startServer() {
+  const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  input.on('line', (line) => {
+    if (!line.trim()) return;
+    try {
+      handleMessage(JSON.parse(line));
+    } catch (error) {
+      send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: `Parse error: ${error.message}` } });
+    }
+  });
+  input.on('close', () => process.exit(0));
+}
+
+if (require.main === module) startServer();
+
+module.exports = {
+  projectLoadDiagnostics
+};
