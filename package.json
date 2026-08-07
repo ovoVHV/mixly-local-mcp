@@ -1,0 +1,11 @@
+{
+  "name": "mixly-local-mcp",
+  "version": "2.2.0",
+  "private": true,
+  "description": "Portable local MCP tools for a user-provided Mixly installation",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "ws": "8.21.2",
+    "yazl": "3.3.1"
+  }
+}
