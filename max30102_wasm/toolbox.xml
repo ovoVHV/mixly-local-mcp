@@ -1,0 +1,25 @@
+<xml>
+  <category name="MAX30102 心率">
+    <block type="max30102_wasm_begin">
+      <value name="ADDRESS"><shadow type="math_number"><field name="NUM">87</field></shadow></value>
+    </block>
+    <block type="max30102_wasm_configure">
+      <value name="POWER"><shadow type="math_number"><field name="NUM">31</field></shadow></value>
+    </block>
+    <block type="max30102_wasm_update"></block>
+    <block type="max30102_wasm_ready"></block>
+    <block type="max30102_wasm_ir"></block>
+    <block type="max30102_wasm_red"></block>
+    <block type="max30102_wasm_beat"></block>
+    <block type="max30102_wasm_bpm"></block>
+    <block type="max30102_wasm_average_bpm"></block>
+    <block type="max30102_wasm_finger">
+      <value name="THRESHOLD"><shadow type="math_number"><field name="NUM">50000</field></shadow></value>
+    </block>
+    <block type="max30102_wasm_led">
+      <value name="AMPLITUDE"><shadow type="math_number"><field name="NUM">10</field></shadow></value>
+    </block>
+    <block type="max30102_wasm_temperature"></block>
+    <block type="max30102_wasm_reset_rate"></block>
+  </category>
+</xml>

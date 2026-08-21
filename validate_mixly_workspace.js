@@ -39,13 +39,84 @@ function resolveWebSocket() {
 
 const WebSocket = resolveWebSocket();
 const cdpPort = Number(process.env.MIXLY_CDP_PORT || 9333);
+const expectedOrigin = process.env.MIXLY_EXPECTED_ORIGIN || '';
+const isMixly4 = process.env.MIXLY_MIXLY4 === '1';
+
+async function fetchJson(url, timeoutMs = 750) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const value = await response.json();
+    if (!Array.isArray(value)) throw new Error('target list is not an array');
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getTargets() {
+  const endpoints = [
+    `http://127.0.0.1:${cdpPort}/json/list`,
+    `http://127.0.0.1:${cdpPort}/json`,
+    `http://localhost:${cdpPort}/json/list`,
+    `http://localhost:${cdpPort}/json`
+  ];
+  const attempts = [];
+  for (const endpoint of endpoints) {
+    try {
+      return { targets: await fetchJson(endpoint), endpoint, attempts };
+    } catch (error) {
+      attempts.push({ endpoint, error: error.name === 'AbortError' ? 'timeout' : String(error.message || error) });
+    }
+  }
+  const error = new Error(`Mixly CDP endpoint unavailable on port ${cdpPort}`);
+  error.details = { code: 'MIXLY_CDP_UNAVAILABLE', cdpPort, expectedOrigin, isMixly4, attempts };
+  throw error;
+}
+
+function scoreTarget(target) {
+  if (!target || target.type !== 'page' || !target.webSocketDebuggerUrl) return -1;
+  if (/^devtools:\/\//i.test(target.url || '') || /devtools/i.test(target.title || '')) return -1;
+  const value = String(target.url || '');
+  let score = 1;
+  if (/\/boards\/index\.html(?:[?#]|$)/i.test(value)) score += 100;
+  else if (/\/mixvm\/index\.html(?:[?#]|$)/i.test(value)) score += 80;
+  if (expectedOrigin) {
+    try {
+      const actual = new URL(value);
+      const expected = new URL(expectedOrigin);
+      const sameLoopback = actual.protocol === expected.protocol && actual.port === expected.port &&
+        ['localhost', '127.0.0.1', '::1'].includes(actual.hostname) &&
+        ['localhost', '127.0.0.1', '::1'].includes(expected.hostname);
+      if (actual.origin === expectedOrigin || sameLoopback) score += 50;
+      else if (isMixly4) return -1;
+    } catch (_) {
+      if (isMixly4) return -1;
+    }
+  }
+  return score;
+}
+
+function selectTarget(targets) {
+  return targets.map((target) => ({ target, score: scoreTarget(target) }))
+    .filter((item) => item.score >= 0)
+    .sort((left, right) => right.score - left.score)[0]?.target || null;
+}
 
 async function main() {
-  const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json`)).json();
-  const page = targets.find((target) =>
-    target.type === 'page' && target.url.includes('/boards/index.html')
-  ) || targets.find((target) => target.type === 'page' && target.title !== 'DevTools');
-  if (!page) throw new Error('Mixly page target not found');
+  const discovery = await getTargets();
+  const page = selectTarget(discovery.targets);
+  if (!page) {
+    const error = new Error('Mixly page target not found');
+    error.details = {
+      code: 'MIXLY_CDP_TARGET_NOT_FOUND', cdpPort, expectedOrigin, isMixly4,
+      endpoint: discovery.endpoint,
+      targets: discovery.targets.map(({ id, type, title, url }) => ({ id, type, title, url }))
+    };
+    throw error;
+  }
   const socket = new WebSocket(page.webSocketDebuggerUrl);
   let id = 0;
   const pending = new Map();
@@ -69,6 +140,45 @@ async function main() {
   if (process.argv[2] === '--navigate') {
     const result = await send('Page.navigate', { url: process.argv[3] });
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    socket.close();
+    return;
+  }
+
+  if (process.argv[2] === '--screenshot') {
+    const outputPath = process.argv[3];
+    if (!outputPath) throw new Error('Missing output path for --screenshot');
+    await send('Page.bringToFront');
+    const result = await send('Page.captureScreenshot', {
+      format: 'png',
+      fromSurface: true,
+      captureBeyondViewport: false
+    });
+    const resolved = path.resolve(outputPath);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, Buffer.from(result.data, 'base64'));
+    process.stdout.write(JSON.stringify({ outputPath: resolved, bytes: Buffer.byteLength(result.data, 'base64') }, null, 2) + '\n');
+    socket.close();
+    return;
+  }
+
+  if (process.argv[2] === '--click-selector') {
+    const selector = process.argv[3];
+    if (!selector) throw new Error('Missing selector for --click-selector');
+    await send('Page.bringToFront');
+    const located = await send('Runtime.evaluate', {
+      expression: `(()=>{const nodes=Array.from(document.querySelectorAll(${JSON.stringify(selector)}));const node=nodes.find((candidate)=>{const style=getComputedStyle(candidate);const rect=candidate.getBoundingClientRect();return rect.width>=2&&rect.height>=2&&style.display!=='none'&&style.visibility!=='hidden'});if(!node)return null;const style=getComputedStyle(node);const rect=node.getBoundingClientRect();return {x:rect.x,y:rect.y,width:rect.width,height:rect.height,display:style.display,visibility:style.visibility,disabled:Boolean(node.disabled)}})()`,
+      returnByValue: true
+    });
+    const rect = located.result && located.result.value;
+    if (!rect || rect.width < 2 || rect.height < 2 || rect.display === 'none' || rect.visibility === 'hidden' || rect.disabled) {
+      throw new Error(`Visible element not found for selector: ${selector}`);
+    }
+    const x = rect.x + rect.width / 2;
+    const y = rect.y + rect.height / 2;
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
+    process.stdout.write(JSON.stringify({ selector, x, y, visible: true, method: 'Input.dispatchMouseEvent' }, null, 2) + '\n');
     socket.close();
     return;
   }
@@ -214,7 +324,9 @@ async function main() {
     return;
   }
 
-  const expression = process.argv[2] || `JSON.stringify({
+  const expression = process.argv[2] === '--expression-file'
+    ? fs.readFileSync(path.resolve(process.argv[3]), 'utf8')
+    : process.argv[2] || `JSON.stringify({
     ready: document.readyState,
     title: document.title,
     url: location.href,
@@ -238,6 +350,10 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error);
+  console.error(JSON.stringify({
+    message: error.message || String(error),
+    details: error.details || null,
+    stack: error.stack || null
+  }));
   process.exitCode = 1;
 });

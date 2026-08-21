@@ -8,7 +8,8 @@ const readline = require('readline');
 const { spawn } = require('child_process');
 
 const root = path.resolve(__dirname, '..');
-const archivePath = path.join(root, 'Mixly_Local_MCP_v2.3.0.zip');
+const packageMetadata = require('./package.json');
+const archivePath = path.join(root, `Mixly_Local_MCP_v${packageMetadata.version}.zip`);
 const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mixly-local-mcp-package-'));
 const compressing = require(path.join(root, 'resources', 'app', 'node_modules', 'compressing'));
 const yauzl = require(path.join(root, 'resources', 'app', 'node_modules', 'yauzl'));
@@ -74,7 +75,7 @@ function callPackagedValidator(validatorPath) {
       'JSON.stringify({ready:document.readyState,blockly:typeof Blockly})'
     ], {
       cwd: temporaryRoot,
-      env: { ...process.env, MIXLY_CDP_PORT: '9333' },
+      env: { ...process.env, MIXLY_CDP_PORT: process.env.MIXLY_CDP_PORT || '9333' },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -118,6 +119,11 @@ async function main() {
     assert(entries.includes('MixlyLocalMCP/mixly_mcp_server.js'));
     assert(entries.includes('MixlyLocalMCP/mixly_code_equivalence.js'));
     assert(entries.includes('MixlyLocalMCP/test_mixly_code_equivalence.js'));
+    assert(entries.includes('MixlyLocalMCP/Mixly4_MCP_Server.cmd'));
+    assert(entries.includes('MixlyLocalMCP/harness_integration/install.js'));
+    assert(entries.includes('MixlyLocalMCP/harness_integration/launcher.js'));
+    assert(entries.includes('MixlyLocalMCP/harness_integration/mcp_router.js'));
+    assert(entries.includes('MixlyLocalMCP/harness_integration/dist/MixlyHarness_Mixly4_Plugin.zip'));
     assert(entries.includes('MixlyLocalMCP/node_modules/ws/index.js'));
     await compressing.zip.uncompress(archivePath, temporaryRoot, { zipFileNameEncoding: 'GBK' });
     const serverPath = path.join(temporaryRoot, 'MixlyLocalMCP', 'mixly_mcp_server.js');
@@ -130,8 +136,8 @@ async function main() {
     const validator = await callPackagedValidator(path.join(
       temporaryRoot, 'MixlyLocalMCP', 'validate_mixly_workspace.js'
     ));
-    assert.equal(packaged.initialization.serverInfo.version, '2.3.0');
-    assert.match(readme, /^# Mixly Local MCP 2\.3\.0/m);
+    assert.equal(packaged.initialization.serverInfo.version, packageMetadata.version);
+    assert.match(readme, new RegExp(`^# Mixly Local MCP ${packageMetadata.version.replace(/\./g, '\\.')}`, 'm'));
     assert.match(readme, /mixly_get_board_profiles/);
     assert.match(readme, /mixly_verify_equivalence/);
     assert.match(readme, /behavioral-strict/);
@@ -139,8 +145,8 @@ async function main() {
     assert.match(readme, /GitHub Issues/);
     assert.match(readme, /gitee\.com\/mixly2\/mixly2\.0-win32-x64\/issues/);
     assert.match(readme, /gitee\.com\/mixly2\/mixly2\.0_src\/issues/);
-    assert.match(packaged.initialization.instructions, /官方目录和 libraries\/ThirdParty/);
-    assert.match(packaged.initialization.instructions, /无需修改 MCP/);
+    assert.match(packaged.initialization.instructions, /传统 ThirdParty/);
+    assert.match(packaged.initialization.instructions, /quer(?:y|ies)/);
     assert.equal(packaged.environment.mixlyRoot, root);
     assert(packaged.environment.boards.length > 5);
     assert(packaged.tools.some((tool) => tool.name === 'mixly_get_block_specs'));

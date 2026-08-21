@@ -5,7 +5,8 @@ const path = require('path');
 
 const toolsDir = __dirname;
 const root = path.resolve(toolsDir, '..');
-const outputPath = path.join(root, 'Mixly_Local_MCP_v2.3.0.zip');
+const packageMetadata = require(path.join(toolsDir, 'package.json'));
+const outputPath = path.join(root, `Mixly_Local_MCP_v${packageMetadata.version}.zip`);
 const packageRoot = 'MixlyLocalMCP';
 const yazl = require(path.join(toolsDir, 'node_modules', 'yazl'));
 
@@ -15,9 +16,10 @@ const sources = [
   { source: path.join(toolsDir, 'test_mixly_code_equivalence.js'), archive: 'test_mixly_code_equivalence.js' },
   { source: path.join(toolsDir, 'validate_mixly_workspace.js'), archive: 'validate_mixly_workspace.js' },
   { source: path.join(toolsDir, 'mixly_mcp_call.js'), archive: 'mixly_mcp_call.js' },
+  { source: path.join(toolsDir, 'Mixly4_MCP_Server.cmd'), archive: 'Mixly4_MCP_Server.cmd' },
   { source: path.join(toolsDir, 'package.json'), archive: 'package.json' },
   { source: path.join(toolsDir, 'package-lock.json'), archive: 'package-lock.json' },
-  { source: path.join(root, 'Mixly_MCP_使用说明.md'), archive: 'README.md' }
+  { source: path.join(toolsDir, 'README.md'), archive: 'README.md' }
 ];
 
 function filesRecursive(directory) {
@@ -34,6 +36,15 @@ for (const filePath of filesRecursive(path.join(toolsDir, 'node_modules'))) {
   sources.push({
     source: filePath,
     archive: path.relative(toolsDir, filePath).replace(/\\/g, '/')
+  });
+}
+
+const harnessRoot = path.join(toolsDir, 'harness_integration');
+for (const filePath of filesRecursive(harnessRoot)) {
+  if (filePath.toLowerCase().endsWith('.png')) continue;
+  sources.push({
+    source: filePath,
+    archive: `harness_integration/${path.relative(harnessRoot, filePath).replace(/\\/g, '/')}`
   });
 }
 

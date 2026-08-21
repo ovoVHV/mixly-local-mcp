@@ -1,0 +1,17 @@
+{
+  "id": "MixlyHarness",
+  "dir": "MixlyHarness",
+  "name": "MixlyHarness",
+  "displayName": "Mixly AI (DeepSeek Harness)",
+  "version": "1.0.0",
+  "latestVersion": "1.0.0",
+  "versions": [
+    "1.0.0"
+  ],
+  "source": "local",
+  "local": true,
+  "mixly": {
+    "generation": 4,
+    "board": "*"
+  }
+}

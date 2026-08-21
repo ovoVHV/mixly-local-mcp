@@ -8,8 +8,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { pathToFileURL } = require('url');
+const zlib = require('zlib');
 const { compareCode } = require('./mixly_code_equivalence');
 
 function looksLikeMixlyRoot(candidate) {
@@ -19,9 +20,28 @@ function looksLikeMixlyRoot(candidate) {
     fs.existsSync(path.join(resolved, 'boards'));
 }
 
+// Mixly 4 is an NW.js app whose board files live at the package root. Older
+// releases keep them below resources/app/src, so the runtime layout must be
+// detected before choosing library and launch behavior.
+function detectMixlyLayout(root) {
+  const packageJson = readJsonFile(path.join(root, 'package.json')) || {};
+  const nodeMain = String(packageJson['node-main'] || '').replace(/\\/g, '/');
+  if (fs.existsSync(path.join(root, 'boards')) && /(?:^|\/)static-server\/server\.js$/i.test(nodeMain)) {
+    return { generation: 4, runtime: 'nwjs', packageJson };
+  }
+  if (fs.existsSync(path.join(root, 'resources', 'app', 'src', 'boards'))) {
+    return { generation: 2, runtime: 'electron', packageJson };
+  }
+  return { generation: 3, runtime: 'source', packageJson };
+}
+
 function resolveMixlyRoot() {
+  const explicit = process.env.MIXLY_HOME;
+  if (explicit && !looksLikeMixlyRoot(explicit)) {
+    throw new Error(`MIXLY_HOME 不是有效的 Mixly 安装目录: ${path.resolve(explicit)}`);
+  }
   const candidates = [
-    process.env.MIXLY_HOME,
+    explicit,
     process.cwd(),
     path.resolve(__dirname, '..')
   ].filter(Boolean);
@@ -34,16 +54,27 @@ function resolveMixlyRoot() {
 
 const ROOT = resolveMixlyRoot();
 const HELPER_DIR = __dirname;
+const MIXLY_LAYOUT = detectMixlyLayout(ROOT);
 const APP_SRC_ROOT = fs.existsSync(path.join(ROOT, 'resources', 'app', 'src', 'boards'))
   ? path.join(ROOT, 'resources', 'app', 'src')
   : ROOT;
 const MIXLY_EXE = path.join(ROOT, process.platform === 'win32' ? 'Mixly.exe' : 'mixly');
 const DEFAULT_LIB_ROOT = path.join(ROOT, 'arduino-cli', 'libraries');
 const BOARDS_DIR = path.join(APP_SRC_ROOT, 'boards');
+const MIXLY4_WASM_DIR = path.join(ROOT, 'common', 'modules', 'web-modules', 'mixly', 'wasm');
+// Mixly 4 stores installed plugins in OPFS.  Keep MCP-created sources in a
+// private, deterministic staging area instead of writing into the read-only
+// application board tree (which also caused the historical EISDIR import
+// failure when a ZIP was unpacked there).
+const MIXLY4_STAGING_DIR = path.join(ROOT, '.mixly-mcp-staging');
 const DEFAULT_CDP_PORT = 9333;
 const MCP_PROTOCOL_VERSION = '2024-11-05';
+const MCP_SERVER_VERSION = require('./package.json').version;
 const COMMAND_TIMEOUT_MS = 180000;
 const DEFAULT_COMPILE_TIMEOUT_MS = 900000;
+const DISCOVERY_CACHE_TTL_MS = 30000;
+const libraryScanCache = new Map();
+const blockSpecsCache = new Map();
 
 const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
 const writesLocal = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
@@ -53,12 +84,34 @@ const toolDefinitions = [
   {
     name: 'mixly_scan_library',
     title: '扫描本地 Mixly 积木',
-    description: '扫描指定板卡当前安装的官方积木、生成器和 ThirdParty 第三方库，同时识别 Mixly 3 的 bundle、xml 和 default_src。结果动态来自本地文件；选中候选后可调用 mixly_get_block_specs 读取真实接口和本地示例。',
+    description: '按关键词扫描当前板卡的官方与第三方积木。用 queries 一次查询多个能力；includeSpecs=true 可在同一调用中附带候选的真实契约，避免再用 shell 查生成器。默认只返回计数摘要，只有确需全集时才传 full=true。结果缓存 30 秒。',
     inputSchema: {
       type: 'object', required: ['board'],
       properties: {
         board: { type: 'string', description: '环境探测返回的板卡 id、boardType、id@型号、唯一型号名或 FQBN。' },
-        boardRoot: { type: 'string', description: '工作区内的自定义板卡根目录；通常不需要。' }
+        boardRoot: { type: 'string', description: '工作区内的自定义板卡根目录；通常不需要。' },
+        query: { type: 'string', maxLength: 120, description: '候选关键词，例如 rgb、oled、serial；普通调用应提供。' },
+        queries: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 120 }, description: '一次查询多个独立能力，例如 ["digital read", "eeprom", "oled"]；与 query 二选一。' },
+        includeSpecs: { type: 'boolean', description: '把匹配 type 的 defaultXml 和输入契约一并返回，最多 20 个；规划复杂工程时建议 true。' },
+        limit: { type: 'integer', minimum: 1, maximum: 500, description: '候选上限，默认 60。' },
+        full: { type: 'boolean', description: '返回完整类型清单；默认 false，可能产生大量 token。' },
+        refresh: { type: 'boolean', description: '忽略 30 秒缓存并重新扫描。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Mixly 4 OPFS 读取使用的 CDP 端口，默认 9333。' }
+      }
+    },
+    annotations: readOnly
+  },
+  {
+    name: 'mixly_scan_arduino_libraries',
+    title: '扫描板卡可用 Arduino 库',
+    description: '按板卡扫描本机可编译的 Arduino 库。Mixly 4 直接读取内置 WASM 库包的 libraries.manifest.json；Mixly 2/3 扫描本地 Arduino 与 ThirdParty 库目录。可按库名或头文件过滤，并按需返回完整文件清单。',
+    inputSchema: {
+      type: 'object', required: ['board'],
+      properties: {
+        board: { type: 'string', description: 'mixly_detect_environment 返回的板卡 id、boardType、profile 或 FQBN。' },
+        libraryNames: { type: 'array', maxItems: 50, items: { type: 'string' }, description: '可选库名过滤，不区分大小写。' },
+        headers: { type: 'array', maxItems: 50, items: { type: 'string' }, description: '可选 #include 头文件过滤，例如 Adafruit_SSD1306.h。' },
+        includeFiles: { type: 'boolean', description: '是否返回每个库的完整文件清单，默认 false。' }
       }
     },
     annotations: readOnly
@@ -66,13 +119,16 @@ const toolDefinitions = [
   {
     name: 'mixly_get_block_specs',
     title: '读取积木真实接口',
-    description: '读取官方或 ThirdParty 积木的真实工具箱 XML、field/value/statement 名称、默认 shadow、可留空输入及生成器回退值、连接类型、定义位置和本地示例工程，帮助 AI 使用当前机器实际安装的积木。',
+    description: '读取指定积木的真实 XML 与输入契约。默认跳过昂贵的示例工程遍历；仅在 defaultXml 不足时传 includeExamples=true。结果缓存 30 秒。',
     inputSchema: {
       type: 'object', required: ['board', 'blockTypes'],
       properties: {
         board: { type: 'string', description: '环境探测返回的板卡 id、boardType、id@型号、唯一型号名或 FQBN。' },
         blockTypes: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string' }, description: '要查询的准确积木 type；一次最多 50 个。' },
-        includeSource: { type: 'boolean', description: '返回精简的块定义和生成器源码片段，默认 false；复杂动态块可开启。' }
+        includeSource: { type: 'boolean', description: '返回精简的块定义和生成器源码片段，默认 false；复杂动态块可开启。' },
+        includeExamples: { type: 'boolean', description: '遍历本地示例并返回用法，默认 false。' },
+        refresh: { type: 'boolean', description: '忽略 30 秒缓存并重新读取。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Mixly 4 OPFS 读取使用的 CDP 端口，默认 9333。' }
       }
     },
     annotations: readOnly
@@ -87,7 +143,8 @@ const toolDefinitions = [
         board: { type: 'string' },
         library: { type: 'string', pattern: '^[A-Za-z][A-Za-z0-9_-]{1,63}$' },
         blockTypes: { type: 'array', maxItems: 30, items: { type: 'string' }, description: '可选；只返回这些块的接口摘要。' },
-        includeSource: { type: 'boolean', description: '是否返回所选积木的精简源码片段，默认 false。' }
+        includeSource: { type: 'boolean', description: '是否返回所选积木的精简源码片段，默认 false。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Mixly 4 OPFS 读取使用的 CDP 端口，默认 9333。' }
       }
     },
     annotations: readOnly
@@ -95,13 +152,15 @@ const toolDefinitions = [
   {
     name: 'mixly_detect_environment',
     title: '探测本机 Mixly 和 Arduino 环境',
-    description: '先调用此工具查找本机 Mixly 根目录、板卡、CDP 状态、arduino-cli 候选路径、CLI 版本和已安装核心。AI 应根据结果选择 CLI、库目录和目标 FQBN。',
+    description: '必须先调用。默认返回精简板卡摘要且不运行 Arduino CLI；准备 CLI 编译时才传 probeCli=true，需要诊断细节时才传 details=true。Mixly 4 会返回 WASM 强制工作流。',
     inputSchema: {
       type: 'object',
       properties: {
         cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: '默认 9333。' },
         arduinoCliPath: { type: 'string', description: '可选的 CLI 候选路径。' },
-        probeCli: { type: 'boolean', description: '是否执行 version/core list，默认 true。' }
+        arduinoCliConfigPath: { type: 'string', description: '可选的 arduino-cli 配置文件；省略时自动使用所选内置 CLI 同目录下的 arduino-cli.json/yaml。' },
+        probeCli: { type: 'boolean', description: '执行 version/core list，默认 false；只在准备 Arduino CLI 编译时开启。' },
+        details: { type: 'boolean', description: '返回完整板卡、CDP targets 和 WASM 包细节，默认 false。' }
       }
     },
     annotations: readOnly
@@ -136,7 +195,7 @@ const toolDefinitions = [
   {
     name: 'mixly_verify_equivalence',
     title: '审计生成代码与参考源码',
-    description: '对参考源码、积木生成代码及生成端辅助源码执行保守静态审计，报告遗漏的保护条件调用、提示文本、常量、副作用调用和必需正则。它不是形式化证明，也不替代真实 Blockly、编译或硬件测试。',
+    description: '对参考源码、积木生成代码及生成端辅助源码执行保守静态审计，报告遗漏或改变的保护条件、提示文本、常量、关键引脚/时序调用和必需正则。它不是形式化证明，也不替代真实 Blockly、编译或硬件测试。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -144,7 +203,8 @@ const toolDefinitions = [
         sourceText: { type: 'string', description: '参考源码文本；与 sourcePath 二选一。' },
         generatedPath: { type: 'string', description: '积木生成的代码文件；与 generatedText 二选一。' },
         generatedText: { type: 'string', description: '积木生成的代码文本；与 generatedPath 二选一。' },
-        supportPaths: { type: 'array', items: { type: 'string' }, description: '生成端自定义 Arduino 库或其他辅助实现文件；会与 generatedPath/generatedText 一起审计。' },
+        supportPaths: { type: 'array', items: { type: 'string' }, description: '生成端自定义 Arduino 库或其他辅助实现文件；用于补充实现审计，默认不参与主文件 requiredPatterns 或 exact 匹配。' },
+        includeSupportInRequiredPatterns: { type: 'boolean', description: '显式允许 requiredPatterns 扫描 supportPaths；默认只扫描主生成文件。' },
         mode: { type: 'string', enum: ['report', 'behavioral-strict', 'exact'], description: '默认 report；behavioral-strict 有缺口即失败，exact 比较去注释且忽略字符串外空白后的文本。' },
         ignoreStrings: { type: 'array', items: { type: 'string' }, description: '已人工确认可忽略的参考源码字符串。' },
         ignoreIdentifiers: { type: 'array', items: { type: 'string' }, description: '已人工确认可忽略的调用或常量名。' },
@@ -157,7 +217,7 @@ const toolDefinitions = [
   {
     name: 'mixly_create_library',
     title: '创建小型自定义积木库',
-    description: '创建兼容的 ThirdParty 积木库，默认生成标准 block/generator/index.xml/config.json 结构。MCP 会提示本地复用、粒度和图片使用风险，但只阻止语法错误或定义/生成器/工具箱缺失等不可用结构。',
+    description: '创建小型缺失积木库。Mixly 2/3 生成传统 ThirdParty 结构；Mixly 4 生成 OPFS 插件暂存目录，浏览器编译需要的非内置 C/C++ 文件必须同时放入 wasmSketchFiles，只有 extraFiles/libraries 不足以让 WASM 编译器参与链接。创建后应调用 mixly_project_workflow，由它自动打包、导入和验证。',
     inputSchema: {
       type: 'object',
       required: ['libraryName', 'board', 'blocksJs', 'generatorsJs', 'toolboxXml'],
@@ -172,6 +232,7 @@ const toolDefinitions = [
         version: { type: 'string', description: 'config.json 版本，默认 1.0.0。' },
         xmlFileName: { type: 'string', pattern: '^[A-Za-z0-9_-]+\\.xml$' },
         extraFiles: { type: 'array', items: { type: 'object' }, description: '可选文件：{relativePath,text} 或 {relativePath,contentBase64}；仅允许 css/language/media/libraries/examples/README。' },
+        wasmSketchFiles: { type: 'array', items: { type: 'object' }, description: 'Mixly 4 专用：随生成代码注入 WASM sketchFiles 的 C/C++ 源文件，格式为 {name,text} 或 {name,contentBase64}；支持 .h/.hpp/.c/.cc/.cpp。' },
         imageMode: { type: 'string', enum: ['none', 'block-icon', 'dropdown-options'], description: '默认 none；使用图片时建议说明是块图标还是图片选项。' },
         userRequestedImages: { type: 'boolean', description: '记录用户是否明确要求图片；不一致时 MCP 返回提示但不阻止。' },
         overwrite: { type: 'boolean', description: '目录存在时允许更新文件，默认 false。' }
@@ -182,7 +243,7 @@ const toolDefinitions = [
   {
     name: 'mixly_build_project',
     title: '从结构树构建 Mixly 工程',
-    description: '把结构化积木树直接序列化为 .mix，自动把全局变量声明连接成一个 next 栈并安排顶层布局。大型树应传 treePath，服务端直接读文件，不把 JSON 放进子进程命令行，因此不会触发 ENAMETOOLONG。',
+    description: '把结构化积木树直接序列化为 .mix，自动转义 XML、嵌套 next 链、连接全局变量声明并安排顶层布局。不要手写 .mix XML；大型树应写 JSON 后传 treePath。Harness 中的 Mixly 4 默认立即刷新当前 Blockly；最终仍必须调用 mixly_project_workflow。',
     inputSchema: {
       type: 'object', required: ['board', 'projectPath'],
       properties: {
@@ -195,7 +256,10 @@ const toolDefinitions = [
         customPrefixes: { type: 'array', items: { type: 'string' } },
         requireChineseNames: { type: 'boolean', description: '默认 true；检查用户可见变量、函数和参数并给出中文命名提示，i/j 等循环下标除外。' },
         allowExternalSourcePath: { type: 'boolean' },
-        overwrite: { type: 'boolean', description: '目标已存在时必须显式为 true。' }
+        overwrite: { type: 'boolean', description: '目标已存在时必须显式为 true。' },
+        livePreview: { type: 'boolean', description: 'Mixly 4 Harness 默认 true：写入后立即载入当前 Blockly；显式 true 时预览失败会让工具失败。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535 },
+        waitMs: { type: 'integer', minimum: 1000, maximum: 120000 }
       }
     },
     annotations: mayOverwrite
@@ -203,7 +267,7 @@ const toolDefinitions = [
   {
     name: 'mixly_save_project',
     title: '校验并写入 Mixly 工程',
-    description: '校验已有 projectXml 后原子写入 .mix。未安装的 type 或无效 XML 会报错；重复 id、变量断链、布局和积木粒度作为 warnings 返回，不阻止写入。',
+    description: '兼容导入已有 projectXml 后原子写入 .mix。会拒绝未安装 type、游离/重复 next 和无效 XML；新工程不要手写 XML，应使用 mixly_build_project 的 tree/treePath。',
     inputSchema: {
       type: 'object', required: ['board', 'projectPath', 'projectXml'],
       properties: {
@@ -215,7 +279,10 @@ const toolDefinitions = [
         customPrefixes: { type: 'array', items: { type: 'string' } },
         requireChineseNames: { type: 'boolean', description: '默认 true；非中文名称只产生提示。绝不能翻译官方 type 或输入名。' },
         allowExternalSourcePath: { type: 'boolean' },
-        overwrite: { type: 'boolean' }
+        overwrite: { type: 'boolean' },
+        livePreview: { type: 'boolean', description: 'Mixly 4 Harness 默认 true：保存后立即载入当前 Blockly。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535 },
+        waitMs: { type: 'integer', minimum: 1000, maximum: 120000 }
       }
     },
     annotations: mayOverwrite
@@ -223,13 +290,14 @@ const toolDefinitions = [
   {
     name: 'mixly_package_library',
     title: '打包 Mixly 积木库',
-    description: '把已安装的小型第三方积木库打成兼容 ZIP。ZIP 只含文件条目，不创建目录条目，从而避免 Mixly 的 EISDIR 导入错误。',
+    description: '把小型第三方积木库打成兼容 ZIP。Mixly 2/3 保持传统 0 目录条目格式；Mixly 4 使用根部 plugin.json/index.xml/index.js，并为嵌套载荷保留必要父目录条目。通常无需单独调用，mixly_project_workflow 会自动打包工程引用的暂存插件。',
     inputSchema: {
       type: 'object', required: ['library'],
       properties: {
         library: { type: 'string', pattern: '^[A-Za-z][A-Za-z0-9_-]{1,63}$' },
         board: { type: 'string', description: '可省略；MCP 会从已安装库目录自动识别。' },
-        outputPath: { type: 'string', description: '工作区内 ZIP 路径，默认 <library>_Mixly_Library.zip。' }
+        outputPath: { type: 'string', description: '工作区内 ZIP 路径，默认 <library>_Mixly_Library.zip。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Mixly 4 OPFS 读取使用的 CDP 端口，默认 9333。' }
       }
     },
     annotations: writesLocal
@@ -237,12 +305,14 @@ const toolDefinitions = [
   {
     name: 'mixly_launch',
     title: '启动 Mixly 调试实例',
-    description: '确保存在带 CDP 远程调试端口的 Mixly 实例；已有实例时直接复用。真实导入、打开、验证和代码生成依赖此实例。',
+    description: '探测并启动当前 Mixly 运行时。Mixly 4 会优先使用安装目录内可提供 CDP 的 64 位 NW.js/SDK 运行时；只有 HTTP 而没有 CDP 不再误报为可用，因为那种实例无法自动导入、打开和点击 WASM 编译。',
     inputSchema: {
       type: 'object',
       properties: {
+        board: { type: 'string', description: 'Mixly 4 建议传入目标板卡；启动后会自动进入板卡页并等待 Blockly/PluginManager 就绪。' },
         cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: '默认 9333。' },
         profilePath: { type: 'string', description: '工作区内的隔离用户目录，默认 .mixly-mcp-profile。' },
+        runtimeExecutable: { type: 'string', description: 'Mixly 4 可选 NW.js 可执行文件，必须位于 MIXLY_HOME 内；省略时优先发现本地 x64 SDK/运行时。' },
         waitMs: { type: 'integer', minimum: 1000, maximum: 120000, description: '默认 30000。' }
       }
     },
@@ -251,7 +321,7 @@ const toolDefinitions = [
   {
     name: 'mixly_import_library',
     title: '真实导入 Mixly 库',
-    description: '通过正在运行的 Mixly 调用 importFromLocalWithZip，导入 ZIP 并刷新第三方工具箱；返回导入错误、文件和积木库状态。',
+    description: '导入并刷新第三方积木库。Mixly 2/3 调用 Electron LibManager；Mixly 4 必须在已打开的可自动化窗口中调用 OPFS PluginManager，并立即挂载插件。项目交付优先调用 mixly_project_workflow 自动完成，不要只生成 ZIP 就停止。',
     inputSchema: {
       type: 'object', required: ['zipPath'],
       properties: {
@@ -266,7 +336,7 @@ const toolDefinitions = [
   {
     name: 'mixly_open_project',
     title: '在 Mixly 中打开工程',
-    description: '把调试实例导航到正确板卡并打开 .mix 工程，等待 Blockly 工作区就绪。',
+    description: '把调试实例导航到正确板卡并打开 .mix 工程。Mixly 4 使用 HTTP URL，并通过 EditorMix.setValue 载入 MCP 已读取的工程文本。',
     inputSchema: {
       type: 'object', required: ['projectPath', 'board'],
       properties: {
@@ -299,7 +369,7 @@ const toolDefinitions = [
   {
     name: 'mixly_generate_code',
     title: '从积木生成目标代码',
-    description: '在真实 Mixly 中加载指定 .mix，自动选择当前板卡可用的 Blockly 代码生成器；也可由 AI 显式指定 generator。',
+    description: '在真实 Mixly 中加载指定 .mix 并生成代码。Mixly 4 优先调用当前 EditorMix.getCode；工程文件和输出文件均由 MCP 进程读写。',
     inputSchema: {
       type: 'object', required: ['projectPath', 'outputPath'],
       properties: {
@@ -314,7 +384,7 @@ const toolDefinitions = [
   {
     name: 'mixly_project_workflow',
     title: '构建并验证 Mixly 工程',
-    description: '一次完成结构树构建、Mixly 启动、工程打开、真实 Blockly 验证、代码生成和可选 Arduino 编译。适合最终闭环；扫描候选和读取规格仍应在构建前单独完成。',
+    description: '最终交付必须调用。一次完成构建或复用已有 .mix、启动 Mixly、自动发现工程引用的暂存积木插件、打包并导入、打开工程、真实 Blockly 验证、代码生成；Mixly 4 C/C++ 默认还会点击可见桌面编译按钮并等待浏览器 WASM 结果。Arduino CLI 仅是可选兼容检查，绝不替代 WASM。',
     inputSchema: {
       type: 'object', required: ['board', 'projectPath'],
       properties: {
@@ -331,17 +401,25 @@ const toolDefinitions = [
         overwrite: { type: 'boolean' },
         cdpPort: { type: 'integer', minimum: 1, maximum: 65535 },
         profilePath: { type: 'string' },
+        runtimeExecutable: { type: 'string', description: '传给 mixly_launch 的可选 Mixly 4 NW.js 运行时。' },
         waitMs: { type: 'integer', minimum: 1000, maximum: 120000 },
         generator: { type: 'string' },
+        autoImportLibraries: { type: 'boolean', description: 'Mixly 4 默认 true：按工程 block type 自动发现、打包并导入暂存插件。' },
+        libraryNames: { type: 'array', items: { type: 'string' }, description: '可选强制导入的积木插件名；工程引用的暂存插件无需手工列出。' },
+        libraryZipPaths: { type: 'array', items: { type: 'string' }, description: '可选已有插件 ZIP；工作流会在打开工程前导入。' },
+        desktopCompile: { type: 'boolean', description: 'Mixly 4 C/C++ 默认 true：点击桌面编译按钮并等待真实 WASM 结果；设 false 才跳过。' },
+        desktopCompileTimeoutMs: { type: 'integer', minimum: 1000, maximum: 900000, description: '桌面 WASM 编译超时，默认 300000 毫秒。' },
         equivalenceMode: { type: 'string', enum: ['report', 'behavioral-strict', 'exact'], description: '传入参考源码时默认 report；严格交付可使用 behavioral-strict 或 exact。' },
         equivalenceSupportPaths: { type: 'array', items: { type: 'string' }, description: '生成端自定义库或辅助实现源码文件。' },
         equivalenceRequiredPatterns: { type: 'array', items: {}, description: '生成端必须保留的关键业务正则。' },
+        equivalenceIncludeSupportInRequiredPatterns: { type: 'boolean', description: '显式允许等价性 requiredPatterns 扫描辅助源码；默认只扫描主生成代码。' },
         equivalenceIgnoreStrings: { type: 'array', items: { type: 'string' } },
         equivalenceIgnoreIdentifiers: { type: 'array', items: { type: 'string' } },
-        compile: { type: 'boolean', description: '为 true 时在生成后调用 arduino-cli。' },
+        compile: { type: 'boolean', description: '额外调用 arduino-cli 做生成代码兼容检查；Mixly 4 的最终结果以 desktopCompile 的 WASM 输出为准。' },
         fqbn: { type: 'string' },
         fqbns: { type: 'array', items: { type: 'string' } },
         arduinoCliPath: { type: 'string' },
+        arduinoCliConfigPath: { type: 'string', description: '可选 arduino-cli 配置文件；内置 CLI 默认自动使用相邻配置。' },
         librariesPath: { type: 'string' },
         librariesPaths: { type: 'array', items: { type: 'string' }, description: '额外 Arduino 库目录列表；可与向后兼容的 librariesPath 同时使用。' },
         mixlyLibraries: { type: 'array', items: { type: 'string' }, description: '当前板卡 ThirdParty 库名称；自动加入各库的 libraries 目录。' },
@@ -353,8 +431,8 @@ const toolDefinitions = [
   },
   {
     name: 'mixly_compile',
-    title: '编译 Arduino 代码',
-    description: '使用用户本机的 arduino-cli 编译 .ino。AI 必须根据环境探测和目标板明确传入 fqbn 或 fqbns；MCP 不下载、不捆绑编译器。',
+    title: 'Arduino CLI 兼容编译',
+    description: '使用用户本机的 arduino-cli 对 .ino 做兼容编译。Mixly 4 桌面端实际使用浏览器 WASM 编译器及独立库包，因此此工具不能冒充桌面 WASM 实测；AI 必须根据环境探测和目标板明确传入 fqbn 或 fqbns。',
     inputSchema: {
       type: 'object', required: ['sketchPath'],
       properties: {
@@ -362,18 +440,41 @@ const toolDefinitions = [
         fqbn: { type: 'string' },
         fqbns: { type: 'array', items: { type: 'string' }, description: '需要连续验证多个板卡配置时使用。' },
         arduinoCliPath: { type: 'string', description: 'AI 探测到的 arduino-cli 路径；省略时 MCP 从环境变量、Mixly 目录和 PATH 查找。' },
+        arduinoCliConfigPath: { type: 'string', description: '可选 arduino-cli 配置文件；内置 CLI 默认自动使用相邻的 arduino-cli.json/yaml，避免误读全局核心。' },
         librariesPath: { type: 'string', description: '单个 Arduino 库目录；为向后兼容保留。' },
         librariesPaths: { type: 'array', items: { type: 'string' }, description: '多个 Arduino 库目录；与 librariesPath 合并、去重后逐个传给 arduino-cli。' },
         board: { type: 'string', description: 'Mixly 板卡 id、boardType、profile 或 FQBN；与 mixlyLibraries 一起使用。' },
         mixlyLibraries: { type: 'array', items: { type: 'string' }, description: 'Mixly ThirdParty 库名称；自动加入当前板卡 ThirdParty/<name>/libraries。' },
         allowExternalPath: { type: 'boolean', description: '显式允许工作区外 sketch/libraries 路径，默认 false。' },
         keepBuild: { type: 'boolean', description: '保留临时构建目录，默认 false。' },
-        timeoutMs: { type: 'integer', minimum: 1000, maximum: 3600000, description: '单个 FQBN 的编译超时；默认 900000 毫秒，ESP32 首次构建可按需增加。' }
+        timeoutMs: { type: 'integer', minimum: 1000, maximum: 3600000, description: '单个 FQBN 的编译超时；默认 900000 毫秒，ESP32 首次构建可按需增加。' },
+        cdpPort: { type: 'integer', minimum: 1, maximum: 65535, description: 'Mixly 4 OPFS Arduino 库物化使用的 CDP 端口，默认 9333。' }
       }
     },
     annotations: writesLocal
   }
 ];
+
+// Harness defaults to a compact, workflow-oriented surface. The remaining
+// tools stay callable over MCP for compatibility, but their schemas are not
+// sent to the model unless the full surface is explicitly requested.
+const compactToolNames = new Set([
+  'mixly_detect_environment',
+  'mixly_get_board_profiles',
+  'mixly_scan_library',
+  'mixly_get_block_specs',
+  'mixly_inspect_library',
+  'mixly_analyze_source',
+  'mixly_create_library',
+  'mixly_build_project',
+  'mixly_project_workflow'
+]);
+
+function listedToolDefinitions() {
+  return process.env.MIXLY_MCP_TOOL_MODE === 'compact'
+    ? toolDefinitions.filter((tool) => compactToolNames.has(tool.name))
+    : toolDefinitions;
+}
 
 function fail(message, details) {
   const error = new Error(message);
@@ -386,6 +487,23 @@ function ensureInsideWorkspace(filePath) {
   const relative = path.relative(ROOT, resolved);
   if (relative.startsWith('..') || path.isAbsolute(relative)) {
     fail(`路径不在 Mixly 工作区内: ${resolved}`);
+  }
+  let existing = resolved;
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
+  }
+  if (fs.existsSync(existing)) {
+    const realRoot = fs.realpathSync.native(ROOT);
+    const realExisting = fs.realpathSync.native(existing);
+    const realRelative = path.relative(realRoot, realExisting);
+    if (realRelative.startsWith('..') || path.isAbsolute(realRelative)) {
+      fail(`路径通过符号链接或联接点离开 Mixly 工作区: ${resolved}`, {
+        resolvedPath: resolved,
+        realExistingPath: realExisting
+      });
+    }
   }
   return resolved;
 }
@@ -523,7 +641,36 @@ function getBoardCatalog() {
   const knownByIndex = new Map(knownBoards.map((board) => [
     String(board.boardIndex || '').replace(/^\.\//, '').replace(/\\/g, '/').toLowerCase(), board
   ]));
-  const indexFiles = filesRecursive(BOARDS_DIR, 'index.xml');
+  const isTemplate = (id) => MIXLY_LAYOUT.generation === 4 &&
+    /^default\/(?:arduino|micropython|python)$/i.test(String(id || '').replace(/\\/g, '/'));
+  const normalizeIndexPath = (boardIndex) => {
+    if (!boardIndex) return null;
+    const normalized = String(boardIndex).replace(/\\/g, '/').replace(/^\.\//, '');
+    const candidate = path.resolve(srcRoot, normalized);
+    const relative = path.relative(BOARDS_DIR, candidate);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    return candidate;
+  };
+  let indexFiles;
+  if (MIXLY_LAYOUT.generation === 4 && knownBoards.length) {
+    // Mixly 4's boards.json contains the user-facing board list. Keep its
+    // order and metadata, then append any physically present unlisted board.
+    indexFiles = knownBoards
+      .map((board) => normalizeIndexPath(board.boardIndex))
+      .filter(Boolean)
+      .filter((filePath) => fs.existsSync(filePath) && fs.statSync(filePath).isFile())
+      .filter((filePath) => !isTemplate(path.dirname(path.relative(BOARDS_DIR, filePath)).replace(/\\/g, '/')));
+    const knownPaths = new Set(indexFiles.map((filePath) => path.resolve(filePath).toLowerCase()));
+    const orphanFiles = filesRecursive(BOARDS_DIR, 'index.xml')
+      .filter((filePath) => !/[\\/]libraries[\\/]/i.test(path.relative(BOARDS_DIR, filePath)))
+      .filter((filePath) => !isTemplate(path.dirname(path.relative(BOARDS_DIR, filePath)).replace(/\\/g, '/')))
+      .filter((filePath) => !knownPaths.has(path.resolve(filePath).toLowerCase()));
+    indexFiles = [...indexFiles, ...orphanFiles];
+  } else {
+    indexFiles = filesRecursive(BOARDS_DIR, 'index.xml')
+      .filter((filePath) => !/[\\/]libraries[\\/]/i.test(path.relative(BOARDS_DIR, filePath)))
+      .filter((filePath) => !isTemplate(path.dirname(path.relative(BOARDS_DIR, filePath)).replace(/\\/g, '/')));
+  }
   boardCatalogCache = indexFiles.map((indexPath) => {
     const relativeIndex = path.relative(srcRoot, indexPath).replace(/\\/g, '/');
     const id = path.dirname(path.relative(BOARDS_DIR, indexPath)).replace(/\\/g, '/');
@@ -550,6 +697,47 @@ function getBoardCatalog() {
     };
   }).sort((left, right) => left.id.localeCompare(right.id));
   return boardCatalogCache;
+}
+
+function boardCatalogDiagnostics() {
+  const srcRoot = APP_SRC_ROOT;
+  const knownPath = path.join(srcRoot, 'boards.json');
+  const knownData = readJsonFile(knownPath);
+  const knownBoards = Array.isArray(knownData) ? knownData : [];
+  const isTemplate = (value) => /^default\/(?:arduino|micropython|python)$/i.test(String(value || '').replace(/\\/g, '/'));
+  const normalize = (value) => {
+    if (!value) return null;
+    const candidate = path.resolve(srcRoot, String(value).replace(/\\/g, '/').replace(/^\.\//, ''));
+    const relative = path.relative(BOARDS_DIR, candidate);
+    return relative.startsWith('..') || path.isAbsolute(relative) ? null : candidate;
+  };
+  const indexed = knownBoards.map((raw) => {
+    const indexPath = normalize(raw && raw.boardIndex);
+    const id = indexPath
+      ? path.dirname(path.relative(BOARDS_DIR, indexPath)).replace(/\\/g, '/')
+      : String(raw && raw.boardIndex || '').replace(/^\.\//, '').replace(/\/index\.xml$/i, '');
+    return {
+      id,
+      boardType: raw && raw.boardType || null,
+      boardIndex: raw && raw.boardIndex || null,
+      template: isTemplate(id),
+      present: Boolean(indexPath && fs.existsSync(indexPath) && fs.statSync(indexPath).isFile()),
+      path: indexPath
+    };
+  });
+  const physical = filesRecursive(BOARDS_DIR, 'index.xml')
+    .filter((filePath) => !/[\\/]libraries[\\/]/i.test(path.relative(BOARDS_DIR, filePath)))
+    .map((filePath) => path.dirname(path.relative(BOARDS_DIR, filePath)).replace(/\\/g, '/'));
+  const knownIds = new Set(indexed.map((item) => item.id.toLowerCase()));
+  const orphan = physical.filter((id) => !knownIds.has(id.toLowerCase()) && !isTemplate(id)).sort();
+  return {
+    indexedCount: indexed.length,
+    availableCount: indexed.filter((item) => item.present && !item.template).length,
+    missing: indexed.filter((item) => !item.present && !item.template),
+    filteredTemplates: indexed.filter((item) => item.template),
+    orphanInstalled: orphan,
+    source: knownBoards.length ? 'boards.json+filesystem' : 'filesystem'
+  };
 }
 
 function getBoard(selector) {
@@ -591,11 +779,33 @@ function getBoard(selector) {
 }
 
 function getCdpPort(args) {
-  return Number(args.cdpPort || DEFAULT_CDP_PORT);
+  return Number(args.cdpPort || process.env.MIXLY_CDP_PORT || DEFAULT_CDP_PORT);
 }
 
 function unique(values) {
   return [...new Set(values)];
+}
+
+function readDiscoveryCache(cache, key, refresh) {
+  if (refresh === true) return null;
+  const entry = cache.get(key);
+  if (!entry) return null;
+  const ageMs = Date.now() - entry.createdAt;
+  if (ageMs >= DISCOVERY_CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return { value: entry.value, ageMs };
+}
+
+function writeDiscoveryCache(cache, key, value) {
+  cache.set(key, { value, createdAt: Date.now() });
+  return value;
+}
+
+function invalidateDiscoveryCaches() {
+  libraryScanCache.clear();
+  blockSpecsCache.clear();
 }
 
 function filesRecursive(directory, suffix) {
@@ -607,6 +817,256 @@ function filesRecursive(directory, suffix) {
     else if (!suffix || entry.name.endsWith(suffix)) result.push(full);
   }
   return result;
+}
+
+const tarManifestCache = new Map();
+
+function tarHeaderString(header, start, length) {
+  const end = header.indexOf(0, start);
+  return header.toString('utf8', start, end < 0 ? start + length : end).trim();
+}
+
+function tarHeaderNumber(header, start, length) {
+  const value = tarHeaderString(header, start, length).replace(/\0/g, '').trim();
+  if (!value) return 0;
+  const parsed = Number.parseInt(value, 8);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// Read one small JSON entry without unpacking the 100+ MB compiler archive.
+function readTarEntry(tarPath, targetName) {
+  if (!fs.existsSync(tarPath) || !fs.statSync(tarPath).isFile()) return null;
+  const wanted = String(targetName).replace(/\\/g, '/').replace(/^\.\//, '');
+  const descriptor = fs.openSync(tarPath, 'r');
+  try {
+    const header = Buffer.alloc(512);
+    let offset = 0;
+    const total = fs.statSync(tarPath).size;
+    while (offset + 512 <= total) {
+      const read = fs.readSync(descriptor, header, 0, 512, offset);
+      if (read !== 512 || header.every((byte) => byte === 0)) break;
+      let name = tarHeaderString(header, 0, 100);
+      const prefix = tarHeaderString(header, 345, 155);
+      if (prefix) name = `${prefix}/${name}`;
+      name = name.replace(/\\/g, '/').replace(/^\.\//, '');
+      const size = tarHeaderNumber(header, 124, 12);
+      const type = String.fromCharCode(header[156] || 0);
+      const dataOffset = offset + 512;
+      if ((name === wanted || name.endsWith(`/${wanted}`)) && (!type || type === '0')) {
+        if (size > 64 * 1024 * 1024) return null;
+        const data = Buffer.alloc(size);
+        if (size) fs.readSync(descriptor, data, 0, size, dataOffset);
+        return data;
+      }
+      offset = dataOffset + Math.ceil(size / 512) * 512;
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return null;
+}
+
+function readTarJson(tarPath, targetName) {
+  const stat = fs.existsSync(tarPath) ? fs.statSync(tarPath) : null;
+  if (!stat || !stat.isFile()) return null;
+  const cacheKey = `${tarPath}:${stat.size}:${stat.mtimeMs}:${targetName}`;
+  if (tarManifestCache.has(cacheKey)) return tarManifestCache.get(cacheKey);
+  const entry = readTarEntry(tarPath, targetName);
+  if (!entry) return null;
+  try {
+    const value = JSON.parse(stripUtf8Bom(entry.toString('utf8')));
+    tarManifestCache.set(cacheKey, value);
+    return value;
+  } catch (_) {
+    tarManifestCache.set(cacheKey, null);
+    return null;
+  }
+}
+
+function mixly4WasmArchives() {
+  if (!fs.existsSync(MIXLY4_WASM_DIR) || !fs.statSync(MIXLY4_WASM_DIR).isDirectory()) return [];
+  return fs.readdirSync(MIXLY4_WASM_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.tar$/i.test(entry.name))
+    .map((entry) => {
+      const libraryMatch = /^(.+)-libraries_[^.]+\.tar$/i.exec(entry.name);
+      const compilerMatch = /^(.+?)wasm_[^.]+\.tar$/i.exec(entry.name);
+      const platform = libraryMatch
+        ? libraryMatch[1].toLowerCase()
+        : (compilerMatch ? compilerMatch[1].toLowerCase() : null);
+      const archivePath = path.join(MIXLY4_WASM_DIR, entry.name);
+      const manifest = libraryMatch
+        ? readTarJson(archivePath, 'libraries.manifest.json')
+        : null;
+      return {
+        platform,
+        kind: libraryMatch ? 'libraries' : (compilerMatch ? 'compiler' : 'other'),
+        archive: archivePath,
+        archiveName: entry.name,
+        manifest
+      };
+    });
+}
+
+function wasmPlatformForBoard(board) {
+  const value = [board && board.id, board && board.boardType, board && board.fqbn]
+    .filter(Boolean).join(' ').toLowerCase();
+  if (/arduino[_/]?avr|arduino:avr|\bavr\b/.test(value)) return 'avr';
+  if (/arduino[_/]?esp32|esp32:|\besp32\b/.test(value)) return 'esp32';
+  if (/arduino[_/]?esp8266|esp8266:|\besp8266\b/.test(value)) return 'esp8266';
+  return null;
+}
+
+function isArduinoBoard(board) {
+  if (!board) return false;
+  if (board.language && !/c\/c\+\+/i.test(String(board.language))) return false;
+  return Boolean(wasmPlatformForBoard(board)) || /arduino/i.test(`${board.id || ''} ${board.boardType || ''}`) ||
+    String(board.fqbn || '').includes(':');
+}
+
+function manifestLibraryEntries(manifest, archivePath, platform) {
+  if (!manifest) return [];
+  const source = Array.isArray(manifest) ? manifest : (manifest.libraries || manifest);
+  if (!source || typeof source !== 'object') return [];
+  return Object.entries(source).map(([key, raw]) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const files = Array.isArray(raw.files) ? raw.files.map(String) : [];
+    const includes = Array.isArray(raw.includes) ? raw.includes.map(String) : [];
+    const headers = unique([
+      ...files.filter((file) => /\.(?:h|hh|hpp|hxx)$/i.test(file)).map((file) => path.basename(file)),
+      ...includes.filter((file) => /\.(?:h|hh|hpp|hxx)$/i.test(file)).map((file) => path.basename(file))
+    ]).sort();
+    return {
+      name: String(key || raw.name || raw.libraryName || '').trim(),
+      displayName: raw.displayName == null ? null : String(raw.displayName),
+      version: raw.version == null ? null : String(raw.version),
+      platform,
+      source: 'mixly4-wasm',
+      archive: archivePath,
+      include: raw.include == null ? null : String(raw.include),
+      includes,
+      headers,
+      dependencies: Array.isArray(raw.dependencies) ? raw.dependencies.map(String) : [],
+      files,
+      fileCount: files.length
+    };
+  }).filter((entry) => entry && entry.name).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function parseLibraryProperties(filePath) {
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return {};
+  const result = {};
+  for (const line of stripUtf8Bom(fs.readFileSync(filePath, 'utf8')).split(/\r?\n/)) {
+    const match = /^\s*([^#=]+?)\s*=\s*(.*?)\s*$/.exec(line);
+    if (match) result[match[1].trim()] = match[2];
+  }
+  return result;
+}
+
+function filesystemArduinoLibraries(board) {
+  const roots = [{ path: DEFAULT_LIB_ROOT, source: 'arduino-cli' }];
+  const thirdPartyRoot = board && board.root
+    ? path.join(board.root, 'libraries', 'ThirdParty')
+    : null;
+  if (thirdPartyRoot && fs.existsSync(thirdPartyRoot)) {
+    for (const entry of fs.readdirSync(thirdPartyRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const nested = path.join(thirdPartyRoot, entry.name, 'libraries');
+      if (fs.existsSync(nested) && fs.statSync(nested).isDirectory()) {
+        roots.push({ path: nested, source: `ThirdParty/${entry.name}` });
+      }
+    }
+  }
+  const result = [];
+  const seen = new Set();
+  for (const root of roots) {
+    if (!fs.existsSync(root.path) || !fs.statSync(root.path).isDirectory()) continue;
+    for (const entry of fs.readdirSync(root.path, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const libraryPath = path.join(root.path, entry.name);
+      const files = filesRecursive(libraryPath).filter((file) => fs.statSync(file).isFile());
+      if (!files.length) continue;
+      const properties = parseLibraryProperties(path.join(libraryPath, 'library.properties'));
+      const headers = files.filter((file) => /\.(?:h|hh|hpp|hxx)$/i.test(file))
+        .map((file) => path.basename(file)).sort();
+      const key = `${root.source}:${entry.name}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({
+        name: properties.name || entry.name,
+        displayName: properties.name || entry.name,
+        version: properties.version || null,
+        platform: wasmPlatformForBoard(board),
+        source: root.source,
+        path: libraryPath,
+        headers: unique(headers),
+        dependencies: properties.depends ? properties.depends.split(',').map((value) => value.trim()).filter(Boolean) : [],
+        files: files.map((file) => path.relative(libraryPath, file).replace(/\\/g, '/')).sort(),
+        fileCount: files.length
+      });
+    }
+  }
+  return result.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function scanArduinoLibraries(args) {
+  const board = getBoard(args.board);
+  if (!isArduinoBoard(board)) {
+    return {
+      board: board.id,
+      boardProfile: board.selectedProfile || null,
+      fqbn: board.fqbn || null,
+      layout: mixlyLayoutSummary(),
+      platform: null,
+      source: 'unsupported-board',
+      archive: null,
+      libraryCount: 0,
+      libraries: [],
+      reason: '当前板卡不是 Arduino C/C++ 板卡，没有可关联的 Arduino 库清单。'
+    };
+  }
+  const platform = wasmPlatformForBoard(board);
+  const archives = mixly4WasmArchives();
+  const archive = MIXLY_LAYOUT.generation === 4
+    ? archives.find((item) => item.kind === 'libraries' && item.platform === platform)
+    : null;
+  let libraries = archive
+    ? manifestLibraryEntries(archive.manifest, archive.archive, platform)
+    : filesystemArduinoLibraries(board);
+  const names = Array.isArray(args.libraryNames)
+    ? args.libraryNames.map((value) => String(value).toLowerCase()).filter(Boolean)
+    : [];
+  const headers = Array.isArray(args.headers)
+    ? args.headers.map((value) => path.basename(String(value).toLowerCase())).filter(Boolean)
+    : [];
+  if (names.length) {
+    libraries = libraries.filter((library) => names.some((name) =>
+      library.name.toLowerCase() === name || String(library.displayName || '').toLowerCase() === name));
+  }
+  if (headers.length) {
+    libraries = libraries.filter((library) => headers.some((header) =>
+      library.headers.some((candidate) => candidate.toLowerCase() === header)));
+  }
+  if (args.includeFiles !== true) {
+    libraries = libraries.map(({ files, path: libraryPath, ...library }) => ({
+      ...library,
+      path: libraryPath || null,
+      files: undefined
+    })).map((library) => {
+      delete library.files;
+      return library;
+    });
+  }
+  return {
+    board: board.id,
+    boardProfile: board.selectedProfile || null,
+    fqbn: board.fqbn || null,
+    layout: mixlyLayoutSummary(),
+    platform,
+    source: archive ? 'mixly4-wasm' : 'filesystem',
+    archive: archive ? archive.archive : null,
+    libraryCount: libraries.length,
+    libraries
+  };
 }
 
 function moduleExportTypes(source) {
@@ -797,6 +1257,21 @@ function extractGeneratorTypes(source) {
   ]);
 }
 
+const NON_BLOCK_MODULE_EXPORTS = new Set([
+  'blocks',
+  'generators',
+  'languages',
+  'blockDefinitions'
+]);
+
+function extractLibraryBlockTypes(source) {
+  return extractBlockTypes(source).filter((type) => !NON_BLOCK_MODULE_EXPORTS.has(type));
+}
+
+function extractLibraryGeneratorTypes(source) {
+  return extractGeneratorTypes(source).filter((type) => !NON_BLOCK_MODULE_EXPORTS.has(type));
+}
+
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -852,7 +1327,17 @@ function resolveAssignedSymbol(source, symbol) {
   return { symbol: current, assignment };
 }
 
-function sourceLocation(files, blockType, kind, includeSource) {
+function displayedSourcePath(filePath, displayRoot, displayPrefix) {
+  if (displayRoot && displayPrefix) {
+    const relative = path.relative(displayRoot, filePath);
+    if (!relative.startsWith('..') && !path.isAbsolute(relative)) {
+      return `${displayPrefix}/${relative.replace(/\\/g, '/')}`;
+    }
+  }
+  return relativeToRoot(filePath);
+}
+
+function sourceLocation(files, blockType, kind, includeSource, displayRoot = null, displayPrefix = null) {
   const escaped = escapeRegExp(blockType);
   const patterns = kind === 'block'
     ? [
@@ -959,7 +1444,7 @@ function sourceLocation(files, blockType, kind, includeSource) {
       excerpt = lines.slice(Math.max(0, line - 3), Math.min(lines.length, line + 55)).join('\n');
     }
     const result = {
-      file: relativeToRoot(filePath),
+      file: displayedSourcePath(filePath, displayRoot, displayPrefix),
       line,
       format: /(?:^|[\\/])[^\\/]*\.bundle(?:\.[^\\/]*)?\.js$/i.test(filePath) ? 'bundle' : 'source'
     };
@@ -1199,7 +1684,7 @@ function readSource(args) {
   if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
     fail(`源码文件不存在: ${sourcePath}`);
   }
-  return fs.readFileSync(sourcePath, 'utf8');
+  return stripUtf8Bom(fs.readFileSync(sourcePath, 'utf8'));
 }
 
 function equivalencePrimaryFile(args, textField, pathField, label, allowExternalPath) {
@@ -1251,6 +1736,174 @@ function checkedRequiredPatterns(patterns) {
   });
 }
 
+function wasmPackageSummary() {
+  return mixly4WasmArchives().map((archive) => {
+    const manifestLibraries = archive.kind === 'libraries'
+      ? manifestLibraryEntries(archive.manifest, archive.archive, archive.platform)
+      : [];
+    const compilerManifest = archive.kind === 'compiler'
+      ? readTarJson(archive.archive, 'manifest.json')
+      : null;
+    const fqbn = compilerFqbnsFromManifest(compilerManifest, archive.platform);
+    return {
+      kind: archive.kind,
+      platform: archive.platform,
+      archive: archive.archive,
+      archiveName: archive.archiveName,
+      archiveBytes: fs.statSync(archive.archive).size,
+      libraryCount: manifestLibraries.length,
+      compilerFqbns: fqbn,
+      libraryManifest: archive.kind === 'libraries' ? 'libraries.manifest.json' : null
+    };
+  });
+}
+
+function compilerFqbnsFromManifest(manifest, platform) {
+  if (!manifest) return [];
+  if (Array.isArray(manifest.fqbns)) return manifest.fqbns.map(String).filter(Boolean);
+  const family = platform === 'avr' ? 'arduino:avr' : (platform === 'esp32' ? 'esp32:esp32' : null);
+  if (!family || !manifest.boards) return [];
+  if (Array.isArray(manifest.boards)) {
+    return manifest.boards.map((item) => item && (item.fqbn || item.board || item.key))
+      .filter(Boolean).map((value) => String(value).includes(':') ? String(value) : `${family}:${value}`);
+  }
+  if (typeof manifest.boards === 'object') {
+    return Object.keys(manifest.boards).map((value) => `${family}:${value}`);
+  }
+  return [];
+}
+
+function mixlyLayoutSummary() {
+  return {
+    generation: MIXLY_LAYOUT.generation,
+    runtime: MIXLY_LAYOUT.runtime,
+    version: MIXLY_LAYOUT.packageJson.version || null,
+    nodeMain: MIXLY_LAYOUT.packageJson['node-main'] || null,
+    main: MIXLY_LAYOUT.packageJson.main || null,
+    chromiumArgs: MIXLY_LAYOUT.packageJson['chromium-args'] || null
+  };
+}
+
+function windowsExecutableArchitecture(executablePath) {
+  if (process.platform !== 'win32' || !executablePath || !fs.existsSync(executablePath)) return null;
+  try {
+    const header = Buffer.alloc(4096);
+    const descriptor = fs.openSync(executablePath, 'r');
+    try {
+      const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+      if (bytesRead < 64 || header.toString('ascii', 0, 2) !== 'MZ') return null;
+      const peOffset = header.readUInt32LE(0x3c);
+      if (peOffset + 6 > bytesRead || header.toString('ascii', peOffset, peOffset + 4) !== 'PE\0\0') return null;
+      const machine = header.readUInt16LE(peOffset + 4);
+      return ({ 0x014c: 'x86', 0x8664: 'x64', 0xaa64: 'arm64' })[machine] || `pe-0x${machine.toString(16)}`;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch (_) {
+    return null;
+  }
+}
+
+function nwExecutablesBelow(container, source) {
+  if (!container || !fs.existsSync(container) || !fs.statSync(container).isDirectory()) return [];
+  const candidates = [];
+  const direct = path.join(container, process.platform === 'win32' ? 'nw.exe' : 'nw');
+  if (fs.existsSync(direct) && fs.statSync(direct).isFile()) candidates.push({ path: direct, source });
+  for (const entry of fs.readdirSync(container, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^nwjs/i.test(entry.name)) continue;
+    const executable = path.join(container, entry.name, process.platform === 'win32' ? 'nw.exe' : 'nw');
+    if (fs.existsSync(executable) && fs.statSync(executable).isFile()) {
+      candidates.push({ path: executable, source });
+    }
+  }
+  return candidates;
+}
+
+function mixly4RuntimeCandidates(explicitPath = null) {
+  const candidates = [];
+  const append = (candidatePath, source) => {
+    if (!candidatePath) return;
+    const resolved = path.resolve(candidatePath);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return;
+    if (candidates.some((item) => item.path.toLowerCase() === resolved.toLowerCase())) return;
+    candidates.push({
+      path: resolved,
+      source,
+      architecture: windowsExecutableArchitecture(resolved),
+      nwRuntime: /^nw(?:\.exe)?$/i.test(path.basename(resolved)),
+      sdk: /nwjs-sdk/i.test(resolved)
+    });
+  };
+  if (explicitPath) {
+    const resolved = ensureInsideWorkspace(explicitPath);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      fail(`指定的 Mixly 4 runtimeExecutable 不存在: ${resolved}`);
+    }
+    append(resolved, 'explicit');
+  }
+  append(process.env.MIXLY4_RUNTIME, 'environment');
+  for (const [relative, source] of [
+    ['.mixly-mcp-nw-sdk-x64/node_modules/nw', 'local-x64-sdk'],
+    ['.mixly-mcp-nw-x64/node_modules/nw', 'local-x64-runtime'],
+    ['node_modules/nw', 'mixly-node-modules']
+  ]) {
+    for (const item of nwExecutablesBelow(path.join(ROOT, ...relative.split('/')), source)) {
+      append(item.path, item.source);
+    }
+  }
+  append(MIXLY_EXE, 'packaged-executable');
+  return candidates.sort((left, right) => {
+    const score = (item) =>
+      (item.source === 'explicit' ? 1000 : 0) +
+      (item.source === 'environment' ? 900 : 0) +
+      (item.architecture === 'x64' ? 100 : item.architecture === 'arm64' ? 80 : 0) +
+      (item.sdk ? 30 : item.nwRuntime ? 20 : 0);
+    return score(right) - score(left);
+  });
+}
+
+function preferredMixlyRuntime(args = {}) {
+  if (!isMixly4()) {
+    return fs.existsSync(MIXLY_EXE)
+      ? { path: MIXLY_EXE, source: 'packaged-executable', architecture: windowsExecutableArchitecture(MIXLY_EXE), nwRuntime: false, sdk: false }
+      : null;
+  }
+  return mixly4RuntimeCandidates(args.runtimeExecutable)[0] || null;
+}
+
+function compileEngineSummary(wasmPackages, selectedCli) {
+  const desktopWasm = isMixly4();
+  const preferredRuntime = preferredMixlyRuntime();
+  const executableArch = preferredRuntime && preferredRuntime.architecture;
+  const archiveBytes = wasmPackages.reduce((total, item) => total + (item.archiveBytes || 0), 0);
+  return {
+    desktop: desktopWasm ? {
+      engine: 'browser-wasm',
+      executable: preferredRuntime && preferredRuntime.path,
+      executableSource: preferredRuntime && preferredRuntime.source,
+      executableArchitecture: executableArch,
+      packageArchiveBytes: archiveBytes,
+      packages: wasmPackages.map(({ kind, platform, archiveName, archiveBytes: bytes }) => ({
+        kind, platform, archiveName, archiveBytes: bytes
+      })),
+      librarySource: 'Mixly 4 WASM archives plus generator.libs_ sketch files',
+      coldStartMemoryRisk: executableArch === 'x86' ? 'high' : 'normal',
+      warning: executableArch === 'x86'
+        ? 'Mixly 4 x86 cold WASM compilation loads and extracts large compiler/library archives in-process; low available memory can terminate the desktop process.'
+        : null
+    } : {
+      engine: 'runtime-dependent',
+      executableArchitecture: executableArch
+    },
+    mcp: {
+      engine: 'arduino-cli',
+      executable: selectedCli,
+      purpose: desktopWasm ? 'generated C++ compatibility check' : 'Arduino compile check',
+      desktopEquivalent: desktopWasm ? false : null
+    }
+  };
+}
+
 function verifyEquivalence(args) {
   const allowExternalPath = args.allowExternalPath === true;
   const sourceFile = equivalencePrimaryFile(args, 'sourceText', 'sourcePath', '参考源码', allowExternalPath);
@@ -1260,10 +1913,12 @@ function verifyEquivalence(args) {
   const result = compareCode({
     mode,
     sourceFiles: [sourceFile],
-    generatedFiles: [generatedFile, ...supportFiles],
+    generatedPrimaryFiles: [generatedFile],
+    supportFiles,
     ignoreStrings: args.ignoreStrings || [],
     ignoreIdentifiers: args.ignoreIdentifiers || [],
-    requiredPatterns: checkedRequiredPatterns(args.requiredPatterns)
+    requiredPatterns: checkedRequiredPatterns(args.requiredPatterns),
+    includeSupportInRequiredPatterns: args.includeSupportInRequiredPatterns === true
   });
   return {
     ...result,
@@ -1389,14 +2044,14 @@ function boardSourceFiles(boardRoot, boardMeta = null) {
   };
 }
 
-function exampleUsages(exampleFiles, blockType, limit = 8) {
+function exampleUsages(exampleFiles, blockType, limit = 8, displayRoot = null, displayPrefix = null) {
   const usages = [];
   for (const filePath of exampleFiles) {
     const source = fs.readFileSync(filePath, 'utf8');
     const blockXml = extractXmlBlock(source, blockType);
     if (!blockXml) continue;
     usages.push({
-      project: relativeToRoot(filePath),
+      project: displayedSourcePath(filePath, displayRoot, displayPrefix),
       blockXml
     });
     if (usages.length >= limit) break;
@@ -1440,44 +2095,41 @@ function libraryFiles(libraryPath) {
   };
 }
 
-function getBlockSpecs(args) {
-  if (!Array.isArray(args.blockTypes) || !args.blockTypes.length || args.blockTypes.length > 50) {
-    fail('blockTypes 必须包含 1 到 50 个积木 type');
-  }
-  const board = getBoard(args.board);
+function blockSpecsFromResources(args, board, libraries, storage) {
   const officialFiles = boardSourceFiles(board.root, board);
-  const thirdPartyRoot = path.join(board.root, 'libraries', 'ThirdParty');
-  const libraries = fs.existsSync(thirdPartyRoot)
-    ? fs.readdirSync(thirdPartyRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => ({ name: entry.name, path: path.join(thirdPartyRoot, entry.name) }))
-    : [];
   const specs = [];
   const unknownTypes = [];
+  const includeExamples = args.includeExamples === true;
 
   for (const blockType of unique(args.blockTypes.map(String))) {
     let owner = 'official';
-    let sourceFiles = officialFiles;
-    let examples = exampleUsages(officialFiles.examples, blockType);
+    let examples = includeExamples ? exampleUsages(officialFiles.examples, blockType) : [];
     let defaultXml = officialFiles.toolboxes
       .map((filePath) => extractXmlBlock(fs.readFileSync(filePath, 'utf8'), blockType))
       .find(Boolean) || (examples[0] && examples[0].blockXml) || null;
-    let definition = sourceLocation(sourceFiles.blocks, blockType, 'block', args.includeSource === true);
-    let generator = sourceLocation(sourceFiles.generators, blockType, 'generator', args.includeSource === true);
+    let definition = sourceLocation(officialFiles.blocks, blockType, 'block', args.includeSource === true);
+    let generator = sourceLocation(officialFiles.generators, blockType, 'generator', args.includeSource === true);
 
     if (!definition && !generator && !defaultXml) {
       for (const library of libraries) {
         const candidateFiles = libraryFiles(library.path);
-        const candidateExamples = candidateFiles.all.filter((filePath) => /\.mix$/i.test(filePath));
-        const candidateUsages = exampleUsages(candidateExamples, blockType);
+        const candidateExamples = includeExamples
+          ? candidateFiles.all.filter((filePath) => /\.mix$/i.test(filePath))
+          : [];
+        const candidateUsages = includeExamples
+          ? exampleUsages(candidateExamples, blockType, 8, library.path, library.owner)
+          : [];
         const candidateXml = candidateFiles.xml
           .map((filePath) => extractXmlBlock(fs.readFileSync(filePath, 'utf8'), blockType))
           .find(Boolean) || (candidateUsages[0] && candidateUsages[0].blockXml) || null;
-        const candidateDefinition = sourceLocation(candidateFiles.blocks, blockType, 'block', args.includeSource === true);
-        const candidateGenerator = sourceLocation(candidateFiles.generators, blockType, 'generator', args.includeSource === true);
+        const candidateDefinition = sourceLocation(
+          candidateFiles.blocks, blockType, 'block', args.includeSource === true, library.path, library.owner
+        );
+        const candidateGenerator = sourceLocation(
+          candidateFiles.generators, blockType, 'generator', args.includeSource === true, library.path, library.owner
+        );
         if (!candidateDefinition && !candidateGenerator && !candidateXml && !candidateUsages.length) continue;
-        owner = `ThirdParty/${library.name}`;
-        sourceFiles = candidateFiles;
+        owner = library.owner;
         examples = candidateUsages;
         defaultXml = candidateXml;
         definition = candidateDefinition;
@@ -1494,17 +2146,20 @@ function getBlockSpecs(args) {
     const generatorSource = generator ? generator.analysisSource : '';
     if (definition) delete definition.analysisSource;
     if (generator) delete generator.analysisSource;
-    specs.push({
+    const spec = {
       type: blockType,
       owner,
       definition,
       generator,
       contract: contractFromSources(defaultXml, definitionSource, generatorSource),
       defaultXml,
-      exampleProjects: examples.map((item) => item.project),
-      exampleXml: examples[0] ? examples[0].blockXml : null,
       usageRule: '复制 defaultXml 的 field/value/statement 名称；只替换 field 值和 shadow 默认值，不翻译接口名称。'
-    });
+    };
+    if (includeExamples) {
+      spec.exampleProjects = examples.map((item) => item.project);
+      spec.exampleXml = examples[0] ? examples[0].blockXml : null;
+    }
+    specs.push(spec);
   }
 
   return {
@@ -1515,6 +2170,8 @@ function getBlockSpecs(args) {
     found: specs.length,
     unknownTypes,
     specs,
+    examplesIncluded: includeExamples,
+    pluginStorage: storage,
     namingRule: {
       interfaceNames: 'type、field name、value name、statement name 必须保持本地定义中的原文',
       userNames: '变量 VAR、函数 NAME、mutation name 与 arg name 使用自然中文，并在声明/读取/赋值/定义/调用处完全一致'
@@ -1522,76 +2179,141 @@ function getBlockSpecs(args) {
   };
 }
 
-function inspectLibrary(args) {
+async function getBlockSpecs(args) {
+  if (!Array.isArray(args.blockTypes) || !args.blockTypes.length || args.blockTypes.length > 50) {
+    fail('blockTypes 必须包含 1 到 50 个积木 type');
+  }
   const board = getBoard(args.board);
-  const libraryPath = path.join(board.root, 'libraries', 'ThirdParty', args.library);
-  if (!fs.existsSync(libraryPath) || !fs.statSync(libraryPath).isDirectory()) {
-    fail(`第三方积木库不存在: ${libraryPath}`);
-  }
-  const files = libraryFiles(libraryPath);
-  const relativeFiles = files.all.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/'));
-  const blockSource = files.blocks.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
-  const generatorSource = files.generators.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
-  const toolboxSource = files.xml.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
-  const toolboxTypes = toolboxBlockTypes(toolboxSource).sort();
-  const definedTypes = extractBlockTypes(blockSource).sort();
-  const generatorTypes = extractGeneratorTypes(generatorSource).sort();
-  const requestedTypes = args.blockTypes && args.blockTypes.length
-    ? args.blockTypes
-    : toolboxTypes.slice(0, 20);
-  const specs = getBlockSpecs({
+  const cacheKey = JSON.stringify({
     board: board.id,
-    blockTypes: requestedTypes,
-    includeSource: args.includeSource === true
-  }).specs.filter((spec) => spec.owner === `ThirdParty/${args.library}`);
-  const configPath = path.join(libraryPath, 'config.json');
-  let config = null;
-  if (fs.existsSync(configPath)) {
-    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch (_) { config = { invalidJson: true }; }
+    profile: board.selectedProfile || null,
+    fqbn: board.fqbn || null,
+    xmlPath: board.xmlPath || null,
+    blockTypes: unique(args.blockTypes.map(String)),
+    includeSource: args.includeSource === true,
+    includeExamples: args.includeExamples === true,
+    cdpPort: isMixly4() ? getCdpPort(args) : null
+  });
+  const cached = readDiscoveryCache(blockSpecsCache, cacheKey, args.refresh);
+  if (cached) {
+    return {
+      ...cached.value,
+      cache: { hit: true, ageMs: cached.ageMs, ttlMs: DISCOVERY_CACHE_TTL_MS }
+    };
   }
-  return {
-    board: board.id,
-    library: args.library,
-    libraryPath,
-    config,
-    structure: {
-      standardLayout: relativeFiles.some((name) => name.startsWith('block/')) &&
-        relativeFiles.some((name) => name.startsWith('generator/')) &&
-        relativeFiles.includes('config.json'),
-      fileCount: relativeFiles.length,
-      topLevelDirectories: unique(relativeFiles.filter((name) => name.includes('/')).map((name) => name.split('/')[0])).sort(),
-      xmlFiles: files.xml.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/')),
-      blockFiles: files.blocks.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/')),
-      generatorFiles: files.generators.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/')),
-      languageFiles: relativeFiles.filter((name) => name.startsWith('language/')),
-      mediaFiles: relativeFiles.filter((name) => name.startsWith('media/')),
-      arduinoLibraryFileCount: relativeFiles.filter((name) => name.startsWith('libraries/')).length,
-      sampleFiles: relativeFiles.filter((name) => !name.startsWith('libraries/')).slice(0, 120)
-    },
-    coverage: {
-      toolboxTypes,
-      definedTypes,
-      generatorTypes,
-      missingDefinitions: toolboxTypes.filter((type) => !definedTypes.includes(type)),
-      missingGenerators: toolboxTypes.filter((type) => !generatorTypes.includes(type))
-    },
-    patterns: {
-      usesFieldImage: /FieldImage/.test(blockSource),
-      usesFieldBitmap: /FieldBitmap/.test(blockSource),
-      usesFieldGridDropdown: /FieldGridDropdown/.test(blockSource),
-      usesDropdown: /FieldDropdown/.test(blockSource),
-      usesLanguageMessages: /Blockly\.Msg/.test(blockSource),
-      scriptReferences: unique([...toolboxSource.matchAll(/<script\b[^>]*>/gi)]
-        .map((m) => markupAttributes(m[0]).src).filter(Boolean)),
-      styleReferences: unique([...toolboxSource.matchAll(/<link\b[^>]*>/gi)]
-        .map((m) => markupAttributes(m[0]).href).filter(Boolean))
-    },
-    imagePolicy: '图片能力仅作为可选表现层：只有用户明确要求图片块图标或图片选项时，才在 mixly_create_library 中传 userRequestedImages=true 和对应 imageMode。',
-    specs
-  };
+  const startedAt = Date.now();
+  const context = await thirdPartyLibraryContext(board, args, { mode: 'analysis' });
+  try {
+    const value = blockSpecsFromResources(args, board, context.resources, context.storage);
+    writeDiscoveryCache(blockSpecsCache, cacheKey, value);
+    return {
+      ...value,
+      cache: { hit: false, ageMs: 0, ttlMs: DISCOVERY_CACHE_TTL_MS, buildMs: Date.now() - startedAt }
+    };
+  } finally {
+    context.cleanup();
+  }
 }
 
-function scanLibrary(args) {
+function libraryResourceDisplayPath(resource, storage) {
+  if (resource.source === 'mixly4-opfs') {
+    return `opfs:${storage.root}/${resource.name}/${resource.version || resource.metadata.version || ''}`.replace(/\/$/, '');
+  }
+  return resource.path;
+}
+
+async function inspectLibrary(args) {
+  const board = getBoard(args.board);
+  const context = await thirdPartyLibraryContext(board, args, {
+    mode: 'analysis', libraryNames: [args.library]
+  });
+  try {
+    const resource = context.resources.find((candidate) => candidate.name.toLowerCase() === args.library.toLowerCase());
+    if (!resource) {
+      if (isMixly4() && !context.storage.available) {
+        fail(`无法确认 Mixly 4 插件是否已安装: ${args.library}`, {
+          code: 'MIXLY4_OPFS_UNAVAILABLE',
+          pluginStorage: context.storage,
+          stagingLibraries: context.resources.map((item) => item.name)
+        });
+      }
+      fail(`第三方积木库不存在: ${args.library}`, {
+        board: board.id,
+        availableLibraries: context.resources.map((item) => item.name),
+        pluginStorage: context.storage
+      });
+    }
+    const files = libraryFiles(resource.path);
+    const relativeFiles = unique(resource.fileList || files.all.map((filePath) =>
+      path.relative(resource.path, filePath).replace(/\\/g, '/'))).sort();
+    const blockSource = files.blocks.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
+    const generatorSource = files.generators.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
+    const toolboxSource = files.xml.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
+    const toolboxTypes = toolboxBlockTypes(toolboxSource).sort();
+    const definedTypes = extractLibraryBlockTypes(blockSource).sort();
+    const generatorTypes = extractLibraryGeneratorTypes(generatorSource).sort();
+    const requestedTypes = args.blockTypes && args.blockTypes.length
+      ? args.blockTypes
+      : toolboxTypes.slice(0, 20);
+    const specs = requestedTypes.length
+      ? blockSpecsFromResources({
+        board: board.id,
+        blockTypes: requestedTypes,
+        includeSource: args.includeSource === true
+      }, board, [resource], context.storage).specs.filter((spec) => spec.owner === resource.owner)
+      : [];
+    const pluginLayout = relativeFiles.includes('index.xml') && relativeFiles.includes('index.js') &&
+      relativeFiles.includes('plugin.json');
+    return {
+      board: board.id,
+      library: resource.name,
+      owner: resource.owner,
+      source: resource.source,
+      installed: resource.installed,
+      libraryPath: libraryResourceDisplayPath(resource, context.storage),
+      config: resource.metadata,
+      pluginStorage: context.storage,
+      structure: {
+        standardLayout: pluginLayout || (relativeFiles.some((name) => name.startsWith('block/')) &&
+          relativeFiles.some((name) => name.startsWith('generator/')) && relativeFiles.includes('config.json')),
+        pluginLayout,
+        fileCount: relativeFiles.length,
+        topLevelDirectories: unique(relativeFiles.filter((name) => name.includes('/')).map((name) => name.split('/')[0])).sort(),
+        xmlFiles: relativeFiles.filter((name) => /\.xml$/i.test(name)),
+        blockFiles: files.blocks.map((filePath) => path.relative(resource.path, filePath).replace(/\\/g, '/')),
+        generatorFiles: files.generators.map((filePath) => path.relative(resource.path, filePath).replace(/\\/g, '/')),
+        languageFiles: relativeFiles.filter((name) => name.startsWith('language/')),
+        mediaFiles: relativeFiles.filter((name) => name.startsWith('media/')),
+        arduinoLibraryFileCount: relativeFiles.filter((name) => name.startsWith('libraries/')).length,
+        sampleFiles: relativeFiles.filter((name) => !name.startsWith('libraries/')).slice(0, 120)
+      },
+      coverage: {
+        toolboxTypes,
+        definedTypes,
+        generatorTypes,
+        missingDefinitions: toolboxTypes.filter((type) => !definedTypes.includes(type)),
+        missingGenerators: toolboxTypes.filter((type) => !generatorTypes.includes(type))
+      },
+      patterns: {
+        usesFieldImage: /FieldImage/.test(blockSource),
+        usesFieldBitmap: /FieldBitmap/.test(blockSource),
+        usesFieldGridDropdown: /FieldGridDropdown/.test(blockSource),
+        usesDropdown: /FieldDropdown/.test(blockSource),
+        usesLanguageMessages: /Blockly\.Msg/.test(blockSource),
+        scriptReferences: unique([...toolboxSource.matchAll(/<script\b[^>]*>/gi)]
+          .map((match) => markupAttributes(match[0]).src).filter(Boolean)),
+        styleReferences: unique([...toolboxSource.matchAll(/<link\b[^>]*>/gi)]
+          .map((match) => markupAttributes(match[0]).href).filter(Boolean))
+      },
+      imagePolicy: '图片能力仅作为可选表现层：只有用户明确要求图片块图标或图片选项时，才在 mixly_create_library 中传 userRequestedImages=true 和对应 imageMode。',
+      specs
+    };
+  } finally {
+    context.cleanup();
+  }
+}
+
+async function scanLibrarySnapshot(args) {
   const selectedBoard = args.boardRoot ? null : getBoard(args.board);
   const boardRoot = args.boardRoot
     ? ensureInsideWorkspace(args.boardRoot)
@@ -1612,61 +2334,357 @@ function scanLibrary(args) {
   const generatorTypes = unique(registeredGeneratorFiles.flatMap((file) =>
     extractGeneratorTypes(analyzedSourceFile(file).source)
   )).sort();
-  const thirdPartyRoot = path.join(boardRoot, 'libraries', 'ThirdParty');
-  const thirdParty = [];
-
-  if (fs.existsSync(thirdPartyRoot)) {
-    for (const entry of fs.readdirSync(thirdPartyRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const libraryPath = path.join(thirdPartyRoot, entry.name);
-      const localFiles = libraryFiles(libraryPath);
-      const xmlFiles = localFiles.xml.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/'));
+  const context = await thirdPartyLibraryContext(selectedBoard || { root: boardRoot }, args, {
+    boardRoot: args.boardRoot ? boardRoot : null,
+    mode: 'analysis'
+  });
+  try {
+    const thirdParty = [];
+    for (const resource of context.resources) {
+      const localFiles = libraryFiles(resource.path);
+      const relativeFiles = unique(resource.fileList || localFiles.all.map((filePath) =>
+        path.relative(resource.path, filePath).replace(/\\/g, '/'))).sort();
+      const xmlFiles = relativeFiles.filter((name) => /\.xml$/i.test(name));
       const customTypes = unique([
         ...localFiles.xml.flatMap((xmlPath) => {
-        const xml = fs.readFileSync(xmlPath, 'utf8');
-        return toolboxBlockTypes(xml);
+          const xml = fs.readFileSync(xmlPath, 'utf8');
+          return toolboxBlockTypes(xml);
         }),
-        ...localFiles.blocks.flatMap((filePath) => extractBlockTypes(fs.readFileSync(filePath, 'utf8')))
+        ...localFiles.blocks.flatMap((filePath) => extractLibraryBlockTypes(fs.readFileSync(filePath, 'utf8')))
       ]).sort();
-      const allRelative = localFiles.all.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/'));
       const blockSource = localFiles.blocks.map((filePath) => fs.readFileSync(filePath, 'utf8')).join('\n');
       thirdParty.push({
-        name: entry.name,
+        name: resource.name,
+        owner: resource.owner,
+        source: resource.source,
+        installed: resource.installed,
+        version: resource.version || resource.metadata.version || null,
+        libraryPath: libraryResourceDisplayPath(resource, context.storage),
         xmlFiles,
         customTypes,
-        standardLayout: allRelative.some((name) => name.startsWith('block/')) &&
-          allRelative.some((name) => name.startsWith('generator/')),
+        standardLayout: (relativeFiles.includes('index.xml') && relativeFiles.includes('index.js') && relativeFiles.includes('plugin.json')) ||
+          (relativeFiles.some((name) => name.startsWith('block/')) && relativeFiles.some((name) => name.startsWith('generator/'))),
+        pluginLayout: relativeFiles.includes('index.xml') && relativeFiles.includes('index.js') && relativeFiles.includes('plugin.json'),
         hasImages: /Field(?:Image|Bitmap)|image[_-]?properties/.test(blockSource),
-        mediaFileCount: allRelative.filter((name) => name.startsWith('media/')).length,
-        arduinoLibraryFileCount: allRelative.filter((name) => name.startsWith('libraries/')).length
+        mediaFileCount: relativeFiles.filter((name) => name.startsWith('media/')).length,
+        arduinoLibraryFileCount: relativeFiles.filter((name) => name.startsWith('libraries/')).length
       });
     }
+
+    const thirdPartyBlockTypes = unique(thirdParty.flatMap((library) => library.customTypes)).sort();
+    const availableBlockTypes = unique([...blockTypes, ...thirdPartyBlockTypes]).sort();
+    let arduinoLibraries = null;
+    if (selectedBoard) {
+      const catalog = scanArduinoLibraries({ board: selectedBoard.id });
+      arduinoLibraries = {
+        source: catalog.source,
+        platform: catalog.platform,
+        archive: catalog.archive,
+        libraryCount: catalog.libraryCount,
+        availableNames: catalog.libraries.map((library) => library.name)
+      };
+    }
+    return {
+      board: selectedBoard,
+      boardRoot,
+      official: {
+        blockFileCount: blockFiles.length,
+        generatorFileCount: generatorFiles.length,
+        toolboxFileCount: sourceFiles.toolboxes.length,
+        exampleProjectCount: sourceFiles.examples.length,
+        bundleFileCount: sourceFiles.bundles.length,
+        companionSourceRoots: sourceFiles.companionRoots.map(relativeToRoot),
+        blockTypeCount: blockTypes.length,
+        generatorTypeCount: generatorTypes.length,
+        discoveryMode: sourceFiles.bundles.length ? 'bundle+toolbox+source' : 'source+toolbox'
+      },
+      blockTypes,
+      generatorTypes,
+      thirdPartyBlockTypes,
+      availableBlockTypes,
+      thirdParty,
+      pluginStorage: context.storage,
+      arduinoLibraries,
+      usageHint: isMixly4()
+        ? 'availableBlockTypes 包含官方积木以及 OPFS/暂存插件积木。pluginStorage.available=false 时只能确认 staging，不能据此断言某个 OPFS 插件未安装。'
+        : 'availableBlockTypes 同时包含官方和 ThirdParty 积木，并兼容打包型板卡。优先复用本地块；不熟悉的 type 可调用 mixly_get_block_specs 获取真实 defaultXml、接口和本地示例。',
+      advisory: '这些是建议，不是阻止规则；AI 可以根据用户目标决定是否创建新库。'
+    };
+  } finally {
+    context.cleanup();
+  }
+}
+
+function compactBoardForDiscovery(board) {
+  if (!board) return null;
+  return {
+    id: board.id,
+    boardType: board.boardType,
+    language: board.language,
+    thirdParty: board.thirdParty,
+    selectedProfile: board.selectedProfile || null,
+    fqbn: board.fqbn || null,
+    xmlPath: board.xmlPath || null
+  };
+}
+
+function typeFamilySummary(types, limit = 24) {
+  const counts = new Map();
+  for (const type of types) {
+    const family = String(type).split('_')[0] || String(type);
+    counts.set(family, (counts.get(family) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([family, count]) => ({ family, count }))
+    .sort((left, right) => right.count - left.count || left.family.localeCompare(right.family))
+    .slice(0, limit);
+}
+
+function matchesDiscoveryQuery(value, terms) {
+  const normalized = String(value || '').toLowerCase();
+  return terms.every((term) => normalized.includes(term));
+}
+
+function discoveryQueries(args) {
+  const single = String(args.query || '').trim();
+  const hasMultiple = Array.isArray(args.queries);
+  const multiple = hasMultiple
+    ? unique(args.queries.map((value) => String(value || '').trim()).filter(Boolean))
+    : [];
+  if (single && multiple.length) fail('query 与 queries 只能使用一个');
+  if (hasMultiple && !multiple.length) fail('queries 至少包含一个非空关键词');
+  if (!multiple.length) return null;
+  if (multiple.length > 8) fail('queries 最多包含 8 个关键词');
+  const oversized = multiple.filter((query) => query.length > 120);
+  if (oversized.length) fail('queries 中每个关键词最多 120 个字符', { oversized });
+  return multiple;
+}
+
+function formatLibraryScan(snapshot, args, cache) {
+  const query = String(args.query || '').trim();
+  const full = args.full === true;
+  const limit = args.limit == null ? 60 : Number(args.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) fail('limit 必须是 1 到 500 的整数');
+  if (query.length > 120) fail('query 最多 120 个字符');
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const board = compactBoardForDiscovery(snapshot.board);
+  const compactStorage = snapshot.pluginStorage ? {
+    kind: snapshot.pluginStorage.kind || null,
+    available: snapshot.pluginStorage.available !== false,
+    root: snapshot.pluginStorage.root || null,
+    reason: snapshot.pluginStorage.reason || null
+  } : null;
+  const compactArduinoLibraries = snapshot.arduinoLibraries ? {
+    source: snapshot.arduinoLibraries.source,
+    platform: snapshot.arduinoLibraries.platform,
+    archive: snapshot.arduinoLibraries.archive,
+    libraryCount: snapshot.arduinoLibraries.libraryCount,
+    availableNameCount: Array.isArray(snapshot.arduinoLibraries.availableNames)
+      ? snapshot.arduinoLibraries.availableNames.length
+      : 0
+  } : null;
+
+  if (full) {
+    return {
+      ...snapshot,
+      resultMode: 'full',
+      query: query || null,
+      cache
+    };
   }
 
-  const thirdPartyBlockTypes = unique(thirdParty.flatMap((library) => library.customTypes)).sort();
-  const availableBlockTypes = unique([...blockTypes, ...thirdPartyBlockTypes]).sort();
+  if (!terms.length) {
+    return {
+      board,
+      boardRoot: snapshot.boardRoot,
+      official: snapshot.official,
+      totals: {
+        officialBlockTypes: snapshot.blockTypes.length,
+        generatorTypes: snapshot.generatorTypes.length,
+        thirdPartyBlockTypes: snapshot.thirdPartyBlockTypes.length,
+        availableBlockTypes: snapshot.availableBlockTypes.length,
+        thirdPartyLibraries: snapshot.thirdParty.length
+      },
+      blockTypes: [],
+      generatorTypes: [],
+      thirdPartyBlockTypes: [],
+      availableBlockTypes: [],
+      thirdParty: snapshot.thirdParty.slice(0, 60).map((library) => ({
+        name: library.name,
+        owner: library.owner,
+        source: library.source,
+        installed: library.installed,
+        version: library.version,
+        typeCount: library.customTypes.length
+      })),
+      typeFamilies: typeFamilySummary(snapshot.availableBlockTypes),
+      pluginStorage: compactStorage,
+      arduinoLibraries: compactArduinoLibraries,
+      resultMode: 'summary',
+      query: null,
+      matchedCount: 0,
+      truncated: snapshot.thirdParty.length > 60,
+      cache,
+      usageHint: '请根据源码能力传 query 获取相关候选；只有审计全集时才传 full=true。选中 type 后调用 mixly_get_block_specs。',
+      advisory: snapshot.advisory
+    };
+  }
+
+  const matchingLibraries = new Set(snapshot.thirdParty
+    .filter((library) => matchesDiscoveryQuery(`${library.name} ${library.owner}`, terms))
+    .map((library) => library.name));
+  const candidates = snapshot.availableBlockTypes.filter((type) => {
+    if (matchesDiscoveryQuery(type, terms)) return true;
+    return snapshot.thirdParty.some((library) =>
+      matchingLibraries.has(library.name) && library.customTypes.includes(type)
+    );
+  });
+  const selectedTypes = candidates.slice(0, limit);
+  const selected = new Set(selectedTypes);
+  const thirdParty = snapshot.thirdParty
+    .filter((library) => matchingLibraries.has(library.name) || library.customTypes.some((type) => selected.has(type)))
+    .map((library) => ({
+      ...library,
+      customTypes: library.customTypes.filter((type) => selected.has(type))
+    }));
+  const matchingArduinoNames = snapshot.arduinoLibraries && Array.isArray(snapshot.arduinoLibraries.availableNames)
+    ? snapshot.arduinoLibraries.availableNames.filter((name) => matchesDiscoveryQuery(name, terms)).slice(0, limit)
+    : [];
   return {
-    board: selectedBoard,
-    boardRoot,
-    official: {
-      blockFileCount: blockFiles.length,
-      generatorFileCount: generatorFiles.length,
-      toolboxFileCount: sourceFiles.toolboxes.length,
-      exampleProjectCount: sourceFiles.examples.length,
-      bundleFileCount: sourceFiles.bundles.length,
-      companionSourceRoots: sourceFiles.companionRoots.map(relativeToRoot),
-      blockTypeCount: blockTypes.length,
-      generatorTypeCount: generatorTypes.length,
-      discoveryMode: sourceFiles.bundles.length ? 'bundle+toolbox+source' : 'source+toolbox'
+    board,
+    boardRoot: snapshot.boardRoot,
+    official: snapshot.official,
+    totals: {
+      officialBlockTypes: snapshot.blockTypes.length,
+      generatorTypes: snapshot.generatorTypes.length,
+      thirdPartyBlockTypes: snapshot.thirdPartyBlockTypes.length,
+      availableBlockTypes: snapshot.availableBlockTypes.length,
+      thirdPartyLibraries: snapshot.thirdParty.length
     },
-    blockTypes,
-    generatorTypes,
-    thirdPartyBlockTypes,
-    availableBlockTypes,
+    blockTypes: snapshot.blockTypes.filter((type) => selected.has(type)),
+    generatorTypes: snapshot.generatorTypes.filter((type) => selected.has(type)),
+    thirdPartyBlockTypes: snapshot.thirdPartyBlockTypes.filter((type) => selected.has(type)),
+    availableBlockTypes: selectedTypes,
     thirdParty,
-    usageHint: 'availableBlockTypes 同时包含官方和 ThirdParty 积木，并兼容打包型板卡。优先复用本地块；不熟悉的 type 可调用 mixly_get_block_specs 获取真实 defaultXml、接口和本地示例。',
-    advisory: '这些是建议，不是阻止规则；AI 可以根据用户目标决定是否创建新库。'
+    pluginStorage: compactStorage,
+    arduinoLibraries: compactArduinoLibraries ? {
+      ...compactArduinoLibraries,
+      matchingNames: matchingArduinoNames
+    } : null,
+    resultMode: 'filtered',
+    query,
+    matchedCount: candidates.length,
+    truncated: candidates.length > selectedTypes.length,
+    limit,
+    cache,
+    usageHint: '候选已按 query 过滤；选中 type 后调用 mixly_get_block_specs，不要为找单个积木请求 full=true。',
+    advisory: snapshot.advisory
   };
+}
+
+async function scanLibrary(args) {
+  const selectedBoard = args.boardRoot ? null : getBoard(args.board);
+  const boardRoot = args.boardRoot ? ensureInsideWorkspace(args.boardRoot) : selectedBoard.root;
+  const queries = discoveryQueries(args);
+  if (queries && args.full === true) fail('queries 不能与 full=true 同时使用');
+  if (args.includeSpecs === true && !selectedBoard) {
+    fail('includeSpecs=true 需要使用 board，不能只传 boardRoot');
+  }
+  const cacheKey = JSON.stringify({
+    board: selectedBoard ? selectedBoard.id : null,
+    profile: selectedBoard && selectedBoard.selectedProfile || null,
+    fqbn: selectedBoard && selectedBoard.fqbn || null,
+    xmlPath: selectedBoard && selectedBoard.xmlPath || null,
+    boardRoot,
+    cdpPort: isMixly4() ? getCdpPort(args) : null
+  });
+  const cached = readDiscoveryCache(libraryScanCache, cacheKey, args.refresh);
+  let snapshot;
+  let cache;
+  if (cached) {
+    snapshot = cached.value;
+    cache = {
+      hit: true,
+      ageMs: cached.ageMs,
+      ttlMs: DISCOVERY_CACHE_TTL_MS
+    };
+  } else {
+    const startedAt = Date.now();
+    snapshot = await scanLibrarySnapshot(args);
+    writeDiscoveryCache(libraryScanCache, cacheKey, snapshot);
+    cache = {
+      hit: false,
+      ageMs: 0,
+      ttlMs: DISCOVERY_CACHE_TTL_MS,
+      buildMs: Date.now() - startedAt
+    };
+  }
+
+  let result;
+  if (queries) {
+    const groups = queries.map((query) => formatLibraryScan(snapshot, { ...args, query, full: false }, cache));
+    const first = groups[0];
+    result = {
+      board: first.board,
+      boardRoot: first.boardRoot,
+      official: first.official,
+      totals: first.totals,
+      resultMode: 'multi-filtered',
+      query: null,
+      queries,
+      matches: groups.map((group) => ({
+        query: group.query,
+        availableBlockTypes: group.availableBlockTypes,
+        matchedCount: group.matchedCount,
+        truncated: group.truncated,
+        thirdParty: group.thirdParty.map((library) => ({
+          name: library.name,
+          owner: library.owner,
+          customTypes: library.customTypes
+        })),
+        arduinoLibraryNames: group.arduinoLibraries && group.arduinoLibraries.matchingNames || []
+      })),
+      availableBlockTypes: unique(groups.flatMap((group) => group.availableBlockTypes)),
+      pluginStorage: first.pluginStorage,
+      arduinoLibraries: first.arduinoLibraries ? {
+        source: first.arduinoLibraries.source,
+        platform: first.arduinoLibraries.platform,
+        libraryCount: first.arduinoLibraries.libraryCount
+      } : null,
+      limitPerQuery: first.limit,
+      cache,
+      usageHint: '已在一次调用中按多个能力分组返回候选；使用附带 specs，或只对最终选中的 type 调用 mixly_get_block_specs。',
+      advisory: snapshot.advisory
+    };
+  } else {
+    result = formatLibraryScan(snapshot, args, cache);
+  }
+
+  if (args.includeSpecs === true) {
+    const specTypes = (result.availableBlockTypes || []).slice(0, 20);
+    const resolved = specTypes.length ? await getBlockSpecs({
+      board: args.board,
+      blockTypes: specTypes,
+      includeExamples: false,
+      includeSource: false,
+      cdpPort: args.cdpPort,
+      refresh: args.refresh
+    }) : { specs: [], unknownTypes: [], cache: null };
+    result = {
+      ...result,
+      specs: resolved.specs.map((spec) => ({
+        type: spec.type,
+        owner: spec.owner,
+        contract: spec.contract,
+        defaultXml: spec.defaultXml
+      })),
+      specTypes,
+      unknownSpecTypes: resolved.unknownTypes,
+      specsTruncated: (result.availableBlockTypes || []).length > specTypes.length,
+      specsCache: resolved.cache
+    };
+  }
+  return result;
 }
 
 function analyzeSource(args) {
@@ -1736,12 +2754,544 @@ function validateLibraryJavaScript(source, label) {
   }
 }
 
+function mixly4BoardStorageKey(board) {
+  const value = String(board && (board.id || board.boardType) || 'board').trim();
+  // Keep the key readable while preventing board ids such as extend/foo from
+  // escaping the staging root or colliding with arbitrary path components.
+  return value.replace(/[\\/]+/g, '__').replace(/[^A-Za-z0-9_.-]+/g, '_') || 'board';
+}
+
+function mixly4StagingLibraryPath(board, libraryName) {
+  return path.join(MIXLY4_STAGING_DIR, 'libraries', mixly4BoardStorageKey(board), libraryName);
+}
+
+function mixly4LegacyStagingLibraryPath(libraryName) {
+  // Early development builds used a board-independent staging directory.  It
+  // is harmless to read it for packaging and makes upgrades non-destructive.
+  return path.join(MIXLY4_STAGING_DIR, 'libraries', libraryName);
+}
+
+function mixly4LibrarySourceCandidates(board, libraryName) {
+  const candidates = [mixly4StagingLibraryPath(board, libraryName)];
+  const legacy = mixly4LegacyStagingLibraryPath(libraryName);
+  if (!candidates.includes(legacy)) candidates.push(legacy);
+  return candidates;
+}
+
+function safePluginRelativePath(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+  if (!normalized || normalized.split('/').some((segment) => !segment || segment === '.' || segment === '..')) return null;
+  if (path.posix.isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized)) return null;
+  return normalized;
+}
+
+function normalizeMixly4PluginMetadata(info, fallbackName) {
+  const source = info && typeof info === 'object' ? info : {};
+  const omitted = new Set([
+    'installed', 'installedAt', 'updatedAt', 'installedFiles', 'libraryFiles', 'exampleFiles',
+    'indexFile', 'entryScriptFiles', 'entryStyleFiles', 'entrySourceMapFiles',
+    'entrySourceMapMap', 'indexXml', 'indexXmlData', 'packageFilesMap', 'packageFileGroups'
+  ]);
+  const metadata = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (omitted.has(key) || value === undefined) continue;
+    metadata[key] = value;
+  }
+  const id = String(source.id || fallbackName || '').trim();
+  const version = String(source.currentVersion || source.version || source.latestVersion || '1.0.0').trim();
+  return {
+    ...metadata,
+    id,
+    // Mixly 4 mounts MicroPython plugin libraries from
+    // <storageRoot>/<dir>/<currentVersion>/libraries while PluginManager
+    // stores files under the id, so dir must default to the id.
+    dir: String(source.dir || id).trim() || id,
+    name: source.name || id,
+    displayName: source.displayName || source.title || source.name || id,
+    version,
+    latestVersion: source.latestVersion || version,
+    versions: Array.isArray(source.versions) && source.versions.length ? source.versions : [version],
+    source: source.source || 'local',
+    local: source.local !== false
+  };
+}
+
+function mixly4StagingResources(board) {
+  const roots = [mixly4StagingLibraryPath(board, '')];
+  const legacyRoot = path.join(MIXLY4_STAGING_DIR, 'libraries');
+  const resources = [];
+  const seen = new Set();
+  const appendDirectory = (libraryPath, name) => {
+    const key = String(name).toLowerCase();
+    if (seen.has(key) || !fs.existsSync(libraryPath) || !fs.statSync(libraryPath).isDirectory()) return;
+    const entryFiles = filesRecursive(libraryPath).filter((filePath) => fs.statSync(filePath).isFile());
+    if (!entryFiles.length) return;
+    seen.add(key);
+    const metadataPath = path.join(libraryPath, 'plugin.json');
+    const metadata = readJsonFile(metadataPath) || {};
+    resources.push({
+      name,
+      owner: `Plugin/${name}`,
+      source: 'mixly4-staging',
+      installed: false,
+      path: libraryPath,
+      metadata: normalizeMixly4PluginMetadata(metadata, name),
+      fileList: entryFiles.map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/')).sort()
+    });
+  };
+  for (const root of roots) {
+    if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) continue;
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (entry.isDirectory()) appendDirectory(path.join(root, entry.name), entry.name);
+    }
+  }
+  // Early Mixly 4 MCP builds used libraries/<name> without a board key. Only
+  // accept directories that look like plugin roots so board-key directories
+  // are not accidentally reported as libraries.
+  if (fs.existsSync(legacyRoot) && fs.statSync(legacyRoot).isDirectory()) {
+    for (const entry of fs.readdirSync(legacyRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(legacyRoot, entry.name);
+      if (!fs.existsSync(path.join(candidate, 'index.xml')) && !fs.existsSync(path.join(candidate, 'plugin.json'))) continue;
+      appendDirectory(candidate, entry.name);
+    }
+  }
+  return resources.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function filesystemThirdPartyResources(boardRoot) {
+  const thirdPartyRoot = path.join(boardRoot, 'libraries', 'ThirdParty');
+  if (!fs.existsSync(thirdPartyRoot) || !fs.statSync(thirdPartyRoot).isDirectory()) return [];
+  return fs.readdirSync(thirdPartyRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const libraryPath = path.join(thirdPartyRoot, entry.name);
+      return {
+        name: entry.name,
+        owner: `ThirdParty/${entry.name}`,
+        source: 'filesystem',
+        installed: true,
+        path: libraryPath,
+        metadata: readJsonFile(path.join(libraryPath, 'config.json')) || {},
+        fileList: filesRecursive(libraryPath)
+          .filter((filePath) => fs.statSync(filePath).isFile())
+          .map((filePath) => path.relative(libraryPath, filePath).replace(/\\/g, '/')).sort()
+      };
+    }).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function mixly4OpfsSnapshotExpression(board, options = {}) {
+  const root = `plugins/libraries/${String(board.boardType || board.id || '').replace(/^\/+/, '')}`;
+  const mode = options.mode || 'analysis';
+  const requestedNames = unique((options.libraryNames || []).map((name) => String(name).toLowerCase()));
+  const maxBase64Bytes = Number(options.maxBase64Bytes || 128 * 1024 * 1024);
+  return `(async()=>{
+    const manager=(typeof Mixly==='object'&&(Mixly.PluginManager||Mixly.StatusBarPlugin))||null;
+    if(!manager||!manager.fs)throw new Error('Mixly.PluginManager.fs is unavailable');
+    const fsApi=manager.fs;
+    const normalize=(value)=>String(value||'').split('\\\\').join('/').replace(/^\\/+/, '').replace(/\\/{2,}/g,'/');
+    const root=normalize(${JSON.stringify(root)});
+    const mode=${JSON.stringify(mode)};
+    const requested=new Set(${JSON.stringify(requestedNames)});
+    const manifestPath=root+'/installed.json';
+    const manifestText=await fsApi.readFile(manifestPath,'utf8').catch(()=> '');
+    if(!manifestText)return JSON.stringify({available:true,root,currentRoot:typeof manager.getStorageRoot==='function'?manager.getStorageRoot():null,manifestFound:false,schemaVersion:null,plugins:[]});
+    let manifest;
+    try{manifest=JSON.parse(manifestText)}catch(error){throw new Error('Invalid Mixly 4 installed.json: '+error.message)}
+    const plugins=[];
+    let transferred=0;
+    const entries=Object.entries(manifest.plugins||{});
+    for(const [manifestKey,rawValue] of entries){
+      const raw=rawValue&&typeof rawValue==='object'?rawValue:{};
+      const id=String(raw.id||manifestKey||'').trim();
+      const aliases=[id,manifestKey,raw.name,raw.displayName].filter(Boolean).map((value)=>String(value).toLowerCase());
+      if(requested.size&&![...requested].some((name)=>aliases.includes(name)))continue;
+      const version=String(raw.currentVersion||raw.version||raw.latestVersion||'').trim();
+      const versionRoot=normalize(root+'/'+id+(version?'/'+version:''));
+      const storedGroups=[
+        raw.installedFiles,raw.libraryFiles,raw.exampleFiles,
+        raw.entryScriptFiles,raw.entryStyleFiles,raw.entrySourceMapFiles,
+        Object.values(raw.packageFilesMap||{}),
+        ...Object.values(raw.packageFileGroups||{})
+      ];
+      let stored=[...new Set(storedGroups.flatMap((group)=>Array.isArray(group)?group:[group])
+        .filter((value)=>typeof value==='string').map(normalize).filter(Boolean))];
+      if(!stored.length&&version){
+        const listed=await fsApi.readDirectory(versionRoot,{recursive:true}).catch(()=>[]);
+        for(const item of listed){
+          const relative=normalize(typeof item==='string'?item:(item&&item.name));
+          if(!relative)continue;
+          const full=normalize(versionRoot+'/'+relative);
+          const stat=await fsApi.stat(full).catch(()=>null);
+          if(stat&&typeof stat.isFile==='function'&&stat.isFile())stored.push(full);
+        }
+      }
+      const fileMap=new Map;
+      for(const storedPath of stored){
+        const full=normalize(storedPath);
+        const prefix=versionRoot+'/';
+        let relative=full.startsWith(prefix)?full.slice(prefix.length):full.split('/').pop();
+        relative=normalize(relative);
+        if(relative&&!relative.split('/').includes('..'))fileMap.set(relative,full);
+      }
+      if(raw.indexFile){
+        const full=normalize(raw.indexFile);
+        const relative=full.startsWith(versionRoot+'/')?full.slice(versionRoot.length+1):full.split('/').pop();
+        if(relative)fileMap.set(normalize(relative),full);
+      }
+      const files=[...fileMap.keys()].sort();
+      const content=[];
+      for(const relative of files){
+        const lower=relative.toLowerCase();
+        const wanted=mode==='full'||(mode==='libraries'&&lower.startsWith('libraries/'))||
+          (mode==='analysis'&&/\\.(?:xml|js|mjs|cjs|json|mix)$/i.test(relative));
+        if(!wanted)continue;
+        const encoded=await fsApi.readFile(fileMap.get(relative),'base64').catch(()=>null);
+        if(encoded==null)continue;
+        transferred+=encoded.length;
+        if(transferred>${maxBase64Bytes})throw new Error('Mixly 4 OPFS snapshot exceeds transfer limit');
+        content.push({relativePath:relative,contentBase64:encoded});
+      }
+      if(raw.indexXml&&!files.some((name)=>name.toLowerCase()==='index.xml')){
+        files.push('index.xml');
+        if(mode==='full'||mode==='analysis')content.push({relativePath:'index.xml',contentBase64:btoa(unescape(encodeURIComponent(String(raw.indexXml))))});
+      }
+      plugins.push({id,name:raw.name||id,version,metadata:raw,files:files.sort(),content});
+    }
+    return JSON.stringify({available:true,root,currentRoot:typeof manager.getStorageRoot==='function'?manager.getStorageRoot():null,manifestFound:true,schemaVersion:manifest.schemaVersion||1,plugins});
+  })()`;
+}
+
+async function readMixly4OpfsSnapshot(board, args = {}, options = {}) {
+  const cdpPort = getCdpPort(args);
+  const cdp = await getCdpDiagnostics(cdpPort);
+  if (!cdp.available) {
+    return {
+      available: false,
+      reason: 'cdp-unavailable',
+      cdpPort,
+      cdp,
+      root: `plugins/libraries/${board.boardType}`,
+      plugins: []
+    };
+  }
+  try {
+    const evaluated = await evaluateCdp(mixly4OpfsSnapshotExpression(board, options), cdpPort);
+    const value = evaluated.value;
+    if (!value || value.available !== true || !Array.isArray(value.plugins)) {
+      return { available: false, reason: 'invalid-opfs-response', cdpPort, cdp, root: null, plugins: [], raw: evaluated.raw };
+    }
+    return { ...value, cdpPort, cdp, reason: null };
+  } catch (error) {
+    return {
+      available: false,
+      reason: 'opfs-read-failed',
+      cdpPort,
+      cdp,
+      root: `plugins/libraries/${board.boardType}`,
+      plugins: [],
+      error: error.message,
+      details: error.details || null
+    };
+  }
+}
+
+function materializeMixly4Plugin(plugin, temporaryRoot) {
+  const name = String(plugin.id || plugin.name || '').trim();
+  const directoryName = name.replace(/[^A-Za-z0-9_.-]+/g, '_') || 'plugin';
+  const pluginRoot = path.join(temporaryRoot, directoryName);
+  fs.mkdirSync(pluginRoot, { recursive: true });
+  for (const item of Array.isArray(plugin.content) ? plugin.content : []) {
+    const relativePath = safePluginRelativePath(item.relativePath);
+    if (!relativePath || typeof item.contentBase64 !== 'string') continue;
+    const outputPath = path.join(pluginRoot, ...relativePath.split('/'));
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, Buffer.from(item.contentBase64, 'base64'));
+  }
+  const metadata = normalizeMixly4PluginMetadata(plugin.metadata, name);
+  const metadataPath = path.join(pluginRoot, 'plugin.json');
+  if (!fs.existsSync(metadataPath)) fs.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+  const fileList = unique([
+    ...(Array.isArray(plugin.files) ? plugin.files.map(safePluginRelativePath).filter(Boolean) : []),
+    'plugin.json'
+  ]).sort();
+  return {
+    name,
+    owner: `Plugin/${name}`,
+    source: 'mixly4-opfs',
+    installed: true,
+    version: plugin.version || metadata.version || null,
+    path: pluginRoot,
+    metadata,
+    fileList
+  };
+}
+
+async function thirdPartyLibraryContext(board, args = {}, options = {}) {
+  const boardRoot = options.boardRoot || board.root;
+  if (!isMixly4() || options.boardRoot) {
+    return {
+      resources: filesystemThirdPartyResources(boardRoot),
+      storage: { kind: 'filesystem', available: true, root: path.join(boardRoot, 'libraries', 'ThirdParty') },
+      cleanup() {}
+    };
+  }
+  const staging = mixly4StagingResources(board);
+  const snapshot = await readMixly4OpfsSnapshot(board, args, {
+    mode: options.mode || 'analysis',
+    libraryNames: options.libraryNames || []
+  });
+  let temporaryRoot = null;
+  let installed = [];
+  if (snapshot.available && snapshot.plugins.length) {
+    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mixly-mcp-opfs-'));
+    installed = snapshot.plugins.map((plugin) => materializeMixly4Plugin(plugin, temporaryRoot));
+  }
+  const byName = new Map(staging.map((resource) => [resource.name.toLowerCase(), resource]));
+  for (const resource of installed) {
+    const key = resource.name.toLowerCase();
+    const staged = byName.get(key);
+    if (staged) resource.stagingPath = staged.path;
+    byName.set(key, resource);
+  }
+  return {
+    resources: [...byName.values()].sort((left, right) => left.name.localeCompare(right.name)),
+    storage: {
+      kind: 'mixly4-opfs',
+      available: snapshot.available,
+      reason: snapshot.reason,
+      root: snapshot.root,
+      currentRoot: snapshot.currentRoot || null,
+      manifestFound: snapshot.manifestFound === true,
+      cdpPort: snapshot.cdpPort,
+      installedPluginCount: installed.length,
+      stagingRoot: path.join(MIXLY4_STAGING_DIR, 'libraries', mixly4BoardStorageKey(board)),
+      stagingPluginCount: staging.length,
+      materializedRoot: temporaryRoot,
+      error: snapshot.error || null
+    },
+    cleanup() {
+      if (temporaryRoot && fs.existsSync(temporaryRoot)) fs.rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  };
+}
+
+function isMixly4LibrarySource(sourceDir) {
+  return isMixly4() && path.resolve(sourceDir).startsWith(path.resolve(MIXLY4_STAGING_DIR) + path.sep);
+}
+
+function stripLegacyLibraryDirectives(source) {
+  return String(source || '')
+    // Closure directives are meaningful in Mixly 2/3 but are not available
+    // inside an ES module loaded by Mixly 4.
+    .replace(/^\s*goog\.(?:provide|require)\s*\([^;]*\);?\s*$/gmi, '')
+    .replace(/^\s*goog\.module\s*\([^;]*\);?\s*$/gmi, '')
+    // A module wrapper supplies its own strict mode; retaining this directive
+    // would be valid but makes generated files unnecessarily noisy.
+    .replace(/^\s*["']use strict["'];\s*$/gmi, '')
+    // Accept callers that already supplied an ES-module export.  The wrapper
+    // below collects those values and emits one canonical export surface.
+    .replace(/^\s*export\s+(?=(?:const|let|var|function|class)\b)/gmi, '')
+    .replace(/^\s*export\s+default\s+/gmi, '')
+    .trim();
+}
+
+function mixly4GeneratorNames(board) {
+  const language = String(board && board.language || '').toLowerCase();
+  if (language.includes('micro')) return ['MicroPython', 'Python', 'generator', 'Arduino'];
+  if (language.includes('python')) return ['Python', 'MicroPython', 'generator', 'Arduino'];
+  return ['Arduino', 'generator', 'MicroPython', 'Python'];
+}
+
+function mixly4IndexXml(toolboxXml, normalizedExtras) {
+  let body = String(toolboxXml || '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<link\b[^>]*\/?\s*>/gi, '')
+    .trim();
+  // PluginManager reads direct child <category> nodes.  Most Mixly 2/3
+  // toolboxes are wrapped in <xml> (or <toolbox>), so unwrap exactly one
+  // outer container before writing the Mixly 4 index file.
+  const wrapped = /^<(?:xml|toolbox)\b[^>]*>([\s\S]*)<\/(?:xml|toolbox)>$/i.exec(body);
+  if (wrapped) body = wrapped[1].trim();
+  const cssLinks = normalizedExtras
+    .filter((item) => /^css\/.*\.css$/i.test(item.relativePath))
+    .map((item) => `<link rel="stylesheet" type="text/css" href="./${item.relativePath}">`);
+  return [
+    '<!-- Mixly 4 plugin toolbox; scripts are loaded as an ES module. -->',
+    '<script type="module" src="./index.js"></script>',
+    ...cssLinks,
+    body
+  ].filter((line) => line !== '').join('\n') + '\n';
+}
+
+function mixly4PluginIndexJs({ blocksJs, generatorsJs, blockTypes, generatorTypes, board, wasmSketchFiles = [] }) {
+  const blockSource = stripLegacyLibraryDirectives(blocksJs);
+  const generatorSource = stripLegacyLibraryDirectives(generatorsJs);
+  const names = mixly4GeneratorNames(board);
+  const namesLiteral = JSON.stringify(names);
+  const blockTypesLiteral = JSON.stringify(unique(blockTypes));
+  const generatorTypesLiteral = JSON.stringify(unique(generatorTypes));
+  const wasmSketchFilesLiteral = JSON.stringify(Object.fromEntries(
+    wasmSketchFiles.map((item) => [item.name, item.content.toString('utf8')])
+  ));
+  // The generated module deliberately provides a small compatibility bridge:
+  // existing Mixly 2/3 sources can continue assigning Blockly.Blocks and
+  // Blockly.Arduino.forBlock, while Mixly 4 receives plain exported maps.
+  return `/* Generated by Mixly Local MCP for Mixly 4. */
+const __globalBlockly = globalThis.Blockly || {};
+let __activeGenerator = null;
+const __dynamicGeneratorKeys = new Set([
+  'definitions_', 'setups_', 'setups_begin_', 'setups_end_', 'libs_',
+  'loops_begin_', 'loops_end_', 'variableDB_', 'nameDB_'
+]);
+function __makeGenerator(name) {
+  const base = (__globalBlockly && (__globalBlockly[name] || __globalBlockly.generator)) || {};
+  const registry = Object.assign(Object.create(base.forBlock || null), base.forBlock || {});
+  const target = Object.assign(Object.create(base), base);
+  target.forBlock = registry;
+  return new Proxy(target, {
+    get(target, key, receiver) {
+      if (key === 'forBlock') return registry;
+      if (__activeGenerator && __dynamicGeneratorKeys.has(key)) return __activeGenerator[key];
+      const value = Reflect.get(target, key, receiver);
+      return typeof value === 'function' && __activeGenerator ? value.bind(__activeGenerator) : value;
+    },
+    set(target, key, value, receiver) {
+      if (__activeGenerator && __dynamicGeneratorKeys.has(key)) {
+        __activeGenerator[key] = value;
+        return true;
+      }
+      return Reflect.set(target, key, value, receiver);
+    }
+  });
+}
+const __blocks = Object.assign(Object.create(__globalBlockly.Blocks || null), __globalBlockly.Blocks || {});
+const __generators = Object.fromEntries(${namesLiteral}.map((name) => [name, __makeGenerator(name)]));
+const __wasmSketchFiles = ${wasmSketchFilesLiteral};
+const __wasmSourceNamesKey = '__mixlyMcpWasmSourceNames';
+const __wasmFinishPatchedKey = '__mixlyMcpWasmFinishPatched';
+function __installWasmSketchFiles(generator) {
+  if (!generator || !Object.keys(__wasmSketchFiles).length) return;
+  if (!generator.libs_ || typeof generator.libs_ !== 'object') generator.libs_ = {};
+  for (const [name, source] of Object.entries(__wasmSketchFiles)) {
+    if (generator.libs_[name] == null) generator.libs_[name] = source;
+  }
+  if (!generator[__wasmSourceNamesKey]) {
+    Object.defineProperty(generator, __wasmSourceNamesKey, {
+      value: new Set(), configurable: true
+    });
+  }
+  for (const name of Object.keys(__wasmSketchFiles)) generator[__wasmSourceNamesKey].add(name);
+  if (generator[__wasmFinishPatchedKey] || typeof generator.finish !== 'function') return;
+  const originalFinish = generator.finish;
+  Object.defineProperty(generator, __wasmFinishPatchedKey, {
+    value: true, configurable: true
+  });
+  generator.finish = function (...args) {
+    const saved = new Map();
+    const libs = this.libs_;
+    if (libs && typeof libs === 'object') {
+      for (const name of this[__wasmSourceNamesKey] || []) {
+        if (!Object.prototype.hasOwnProperty.call(libs, name)) continue;
+        saved.set(name, libs[name]);
+        delete libs[name];
+      }
+    }
+    try {
+      return originalFinish.apply(this, args);
+    } finally {
+      if (libs && typeof libs === 'object') {
+        for (const [name, source] of saved) libs[name] = source;
+      }
+    }
+  };
+}
+const __defineBlocksWithJsonArray = (definitions) => {
+  for (const definition of Array.isArray(definitions) ? definitions : []) {
+    if (!definition || !definition.type) continue;
+    const json = definition;
+    __blocks[definition.type] = { init() { this.jsonInit(json); } };
+  }
+};
+const Blockly = Object.assign({}, __globalBlockly, {
+  Blocks: __blocks,
+  Arduino: __generators.Arduino,
+  Python: __generators.Python,
+  MicroPython: __generators.MicroPython,
+  generator: __generators.generator,
+  defineBlocksWithJsonArray: __defineBlocksWithJsonArray,
+  common: Object.assign({}, __globalBlockly.common || {}, { defineBlocksWithJsonArray: __defineBlocksWithJsonArray })
+});
+const goog = globalThis.goog || { provide() {}, require() {}, module() {} };
+(() => {
+${blockSource}
+  if (typeof blocks !== 'undefined' && blocks && typeof blocks === 'object') Object.assign(__blocks, blocks);
+  if (typeof blockDefinitions !== 'undefined' && Array.isArray(blockDefinitions)) __defineBlocksWithJsonArray(blockDefinitions);
+})();
+(() => {
+${generatorSource}
+  if (typeof generators !== 'undefined' && generators && typeof generators === 'object') {
+    for (const name of ${namesLiteral}) Object.assign(__generators[name].forBlock, generators);
+  }
+})();
+function __wrapGenerator(fn) {
+  if (typeof fn !== 'function') return fn;
+  return function (...args) {
+    const previous = __activeGenerator;
+    __activeGenerator = args[1] || null;
+    try {
+      __installWasmSketchFiles(__activeGenerator);
+      return fn.apply(this, args);
+    } finally { __activeGenerator = previous; }
+  };
+}
+const __blockTypes = ${blockTypesLiteral};
+const __generatorTypes = ${generatorTypesLiteral};
+const __exportedBlocks = Object.fromEntries(__blockTypes.map((type) => [type, __blocks[type]]).filter(([, value]) => value));
+const __exportedGenerators = Object.fromEntries(__generatorTypes.map((type) => {
+  for (const name of ${namesLiteral}) {
+    const target = __generators[name];
+    if (target && typeof target.forBlock?.[type] === 'function') return [type, __wrapGenerator(target.forBlock[type])];
+    if (target && typeof target[type] === 'function') return [type, __wrapGenerator(target[type])];
+  }
+  return [type, undefined];
+}).filter(([, value]) => value));
+export { __exportedBlocks as blocks, __exportedGenerators as generators };
+`;
+}
+
+function validateMixly4Module(source, label) {
+  const temporary = path.join(os.tmpdir(), `mixly4-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.mjs`);
+  try {
+    fs.writeFileSync(temporary, source, 'utf8');
+    const result = spawnSync(process.execPath, ['--check', temporary], {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 30000
+    });
+    if (result.error || result.status !== 0) {
+      fail(`${label} Mixly 4 ES 模块语法错误`, {
+        stderr: String(result.stderr || ''),
+        stdout: String(result.stdout || ''),
+        error: result.error ? result.error.message : null
+      });
+    }
+  } finally {
+    try { if (fs.existsSync(temporary)) fs.rmSync(temporary, { force: true }); } catch (_) { /* best effort */ }
+  }
+}
+
 function createLibrary(args) {
   const board = getBoard(args.board);
   const libraryName = args.libraryName;
-  const destination = path.join(board.root, 'libraries', 'ThirdParty', libraryName);
+  const mixly4 = isMixly4();
+  const destination = mixly4
+    ? mixly4StagingLibraryPath(board, libraryName)
+    : path.join(board.root, 'libraries', 'ThirdParty', libraryName);
   const layout = args.layout || 'standard';
-  const xmlFileName = args.xmlFileName || (layout === 'standard' ? 'index.xml' : `${libraryName.toLowerCase()}.xml`);
+  const xmlFileName = mixly4
+    ? 'index.xml'
+    : (args.xmlFileName || (layout === 'standard' ? 'index.xml' : `${libraryName.toLowerCase()}.xml`));
   if (fs.existsSync(destination) && args.overwrite !== true) {
     fail(`积木库已存在；如需更新请显式传 overwrite=true: ${destination}`);
   }
@@ -1806,6 +3356,27 @@ function createLibrary(args) {
     };
   });
   const imageMode = args.imageMode || 'none';
+  const wasmSketchFiles = (Array.isArray(args.wasmSketchFiles) ? args.wasmSketchFiles : []).map((item, index) => {
+    if (!item || typeof item !== 'object') fail(`wasmSketchFiles[${index}] 必须是对象`);
+    const name = String(item.name || '').trim();
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,127}\.(?:h|hpp|c|cc|cpp)$/i.test(name) || /[\\/]/.test(name)) {
+      fail(`wasmSketchFiles[${index}].name 必须是无目录的 C/C++ 文件名: ${name}`);
+    }
+    const hasText = typeof item.text === 'string';
+    const hasBase64 = typeof item.contentBase64 === 'string';
+    if (hasText === hasBase64) fail(`wasmSketchFiles[${index}] 必须且只能提供 text 或 contentBase64`);
+    return {
+      name,
+      content: hasText ? Buffer.from(item.text, 'utf8') : Buffer.from(item.contentBase64, 'base64')
+    };
+  });
+  const duplicateWasmNames = wasmSketchFiles
+    .map((item) => item.name.toLowerCase())
+    .filter((name, index, values) => values.indexOf(name) !== index);
+  if (duplicateWasmNames.length) fail(`wasmSketchFiles 文件名重复: ${unique(duplicateWasmNames).join(', ')}`);
+  if (wasmSketchFiles.length && !mixly4) {
+    warnings.push('wasmSketchFiles 仅在 Mixly 4 插件模块中注入；旧版 Mixly 请同时通过 extraFiles 提供 Arduino libraries。');
+  }
   const sourceUsesImages = /Field(?:Image|Bitmap)|FieldGridDropdown|image[_-]?properties/i.test(args.blocksJs);
   const hasMediaImages = normalizedExtras.some((item) =>
     item.relativePath.startsWith('media/') && /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i.test(item.relativePath)
@@ -1819,7 +3390,50 @@ function createLibrary(args) {
 
   const slug = libraryName.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
   const files = new Map();
-  if (layout === 'standard') {
+  if (mixly4) {
+    if (args.xmlFileName && args.xmlFileName !== 'index.xml') {
+      warnings.push('Mixly 4 PluginManager 只识别根部 index.xml，已忽略自定义 xmlFileName');
+    }
+    if (layout === 'flat') warnings.push('Mixly 4 使用插件布局，已忽略 layout=flat');
+    const pluginVersion = String(args.version || '1.0.0');
+    const pluginXml = mixly4IndexXml(args.toolboxXml, normalizedExtras);
+    const pluginJs = mixly4PluginIndexJs({
+      blocksJs: args.blocksJs,
+      generatorsJs: args.generatorsJs,
+      blockTypes: toolboxTypes,
+      generatorTypes,
+      board,
+      wasmSketchFiles
+    });
+    validateMixly4Module(pluginJs, 'index.js');
+    const pluginMetadata = {
+      id: libraryName,
+      // dir mirrors id: the MicroPython uploader resolves installed library
+      // directories through manifest.dir, not through the id-based path that
+      // PluginManager writes to.
+      dir: libraryName,
+      name: libraryName,
+      displayName: libraryName,
+      version: pluginVersion,
+      latestVersion: pluginVersion,
+      versions: [pluginVersion],
+      source: 'local',
+      local: true,
+      // Mixly 4's default rules already copy these two directories.  Keeping
+      // the declaration explicit makes the ZIP self-describing and lets a
+      // future PluginManager retain additional media/language files.
+      storageRules: [
+        { type: 'directory', source: 'libraries', listKey: 'libraryFiles' },
+        { type: 'directory', source: 'examples', listKey: 'exampleFiles' },
+        { type: 'directory', source: 'media' },
+        { type: 'directory', source: 'language' }
+      ],
+      mixly: { generation: 4, board: board.id }
+    };
+    files.set('index.xml', Buffer.from(pluginXml, 'utf8'));
+    files.set('index.js', Buffer.from(pluginJs, 'utf8'));
+    files.set('plugin.json', Buffer.from(`${JSON.stringify(pluginMetadata, null, 2)}\n`, 'utf8'));
+  } else if (layout === 'standard') {
     const toolboxBody = args.toolboxXml
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
       .replace(/<link\b[^>]*\/?\s*>/gi, '')
@@ -1862,12 +3476,16 @@ function createLibrary(args) {
     if (fs.existsSync(temporary)) fs.rmSync(temporary, { recursive: true, force: true });
     throw error;
   }
+  invalidateDiscoveryCaches();
   return {
     libraryName,
     board: board.id,
     destination,
     layout,
+    format: mixly4 ? 'mixly4-plugin-staging' : 'mixly-legacy',
+    staging: mixly4,
     files: [...files.keys()].sort(),
+    wasmSketchFiles: wasmSketchFiles.map((item) => ({ name: item.name, bytes: item.content.length })),
     blockTypes,
     imageMode,
     warnings,
@@ -1948,9 +3566,13 @@ function mutationAttribute(mutation, name) {
   return mutation.attributes && mutation.attributes[name];
 }
 
-function mutationXmlWithAttributes(source, attributes) {
+function mutationXmlWithAttributes(source, attributes = {}, removeNames = []) {
   return String(source).replace(/<mutation\b([^>]*?)(\/?)>/i, (tag, body, selfClosing) => {
     let updated = body;
+    for (const name of removeNames) {
+      const pattern = new RegExp(`\\s+${escapeRegExp(name)}\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+)`, 'i');
+      updated = updated.replace(pattern, '');
+    }
     for (const [name, value] of Object.entries(attributes)) {
       const pattern = new RegExp(`\\s+${escapeRegExp(name)}\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+)`, 'i');
       updated = updated.replace(pattern, '');
@@ -1960,38 +3582,73 @@ function mutationXmlWithAttributes(source, attributes) {
   });
 }
 
-function inferControlsIfMutation(node) {
+function inferControlsIfMutation(node, diagnostic) {
   if (!node || node.type !== 'controls_if') return;
   const connectionNames = [
-    ...Object.keys(node.values || {}),
-    ...Object.keys(node.statements || {})
+    ...Object.entries(node.values || {})
+      .filter(([, connection]) => Boolean(connection))
+      .map(([name]) => name),
+    ...Object.entries(node.statements || {})
+      .filter(([, connection]) => Boolean(connection))
+      .map(([name]) => name)
   ];
   const branchIndexes = connectionNames
     .map((name) => /^(?:IF|DO)(\d+)$/.exec(name))
     .filter(Boolean)
     .map((match) => Number(match[1]));
   const inferredElseIf = branchIndexes.length ? Math.max(...branchIndexes) : 0;
-  const hasElse = Object.prototype.hasOwnProperty.call(node.statements || {}, 'ELSE');
-  if (!inferredElseIf && !hasElse) return;
+  const presentIndexes = new Set(branchIndexes);
+  const missingIndexes = Array.from({ length: inferredElseIf }, (_, index) => index + 1)
+    .filter((index) => !presentIndexes.has(index));
+  if (missingIndexes.length) {
+    fail('controls_if 分支编号不连续，会生成空的中间分支', {
+      node: diagnostic || { id: node.id || null, type: node.type },
+      missingIndexes,
+      suppliedConnections: connectionNames.sort(),
+      writePrevented: true
+    });
+  }
+  const hasElse = Boolean(node.statements && node.statements.ELSE);
 
   const attributes = {};
   if (inferredElseIf) {
-    const existing = Number(mutationAttribute(node.mutation, 'elseif')) || 0;
-    attributes.elseif = Math.max(existing, inferredElseIf);
+    attributes.elseif = inferredElseIf;
   }
   if (hasElse) attributes.else = 1;
 
   if (typeof node.mutation === 'string') {
-    node.mutation = /<mutation\b/i.test(node.mutation)
-      ? mutationXmlWithAttributes(node.mutation, attributes)
-      : { attributes };
+    if (/<mutation\b/i.test(node.mutation)) {
+      node.mutation = mutationXmlWithAttributes(node.mutation, attributes, ['elseif', 'else']);
+    } else if (Object.keys(attributes).length) {
+      node.mutation = { attributes };
+    } else {
+      delete node.mutation;
+    }
   } else if (node.mutation && node.mutation.xml) {
     node.mutation = {
       ...node.mutation,
-      xml: mutationXmlWithAttributes(node.mutation.xml, attributes)
+      xml: mutationXmlWithAttributes(node.mutation.xml, attributes, ['elseif', 'else'])
     };
+  } else if (node.mutation && typeof node.mutation === 'object') {
+    const mutation = { ...node.mutation };
+    delete mutation.elseif;
+    delete mutation.else;
+    const nestedAttributes = { ...(mutation.attributes || {}) };
+    delete nestedAttributes.elseif;
+    delete nestedAttributes.else;
+    Object.assign(nestedAttributes, attributes);
+    if (Object.keys(nestedAttributes).length) mutation.attributes = nestedAttributes;
+    else delete mutation.attributes;
+    Object.assign(mutation, attributes);
+    if (!Object.keys(attributes).length) {
+      delete mutation.elseif;
+      delete mutation.else;
+    }
+    node.mutation = Object.keys(mutation).length ? mutation : undefined;
+  } else if (Object.keys(attributes).length) {
+    node.mutation = { ...attributes };
   } else {
-    node.mutation = { ...(node.mutation || {}), ...attributes };
+    delete node.mutation;
   }
 }
 
@@ -2031,7 +3688,9 @@ function normalizeProjectTree(tree) {
   }
   cloned.blocks = blocks;
   delete cloned.topBlocks;
-  for (const { node } of projectTreeNodeEntries(cloned)) inferControlsIfMutation(node);
+  for (const { node, id, path: nodePath } of projectTreeNodeEntries(cloned)) {
+    inferControlsIfMutation(node, { type: node.type, id, path: nodePath });
+  }
   return cloned;
 }
 
@@ -2115,6 +3774,7 @@ function parseProjectXml(projectXml) {
   const stack = [];
   const blocks = [];
   const ids = [];
+  const structureErrors = [];
   const tokens = projectXml.match(/<!--[\s\S]*?-->|<[^>]+>|[^<]+/g) || [];
   for (const token of tokens) {
     if (token.startsWith('<!--')) continue;
@@ -2130,18 +3790,62 @@ function parseProjectXml(projectXml) {
       if (entry.name === 'field' && entry.owner) {
         entry.owner.fields[entry.attributes.name || ''] = decodeXmlText(entry.text.trim());
       }
+      if (entry.name === 'next' && entry.childBlocks !== 1) {
+        structureErrors.push({
+          code: 'INVALID_NEXT_CHILD_COUNT',
+          owner: entry.ownerBlock ? { type: entry.ownerBlock.type, id: entry.ownerBlock.id } : null,
+          childBlocks: entry.childBlocks
+        });
+      }
       continue;
     }
     if (/^<\?/.test(token) || /^<!/.test(token)) continue;
     const name = (token.match(/^<\s*([A-Za-z0-9_:.-]+)/) || [])[1];
     if (!name) continue;
     const attributes = xmlAttributes(token);
+    const directParentEntry = stack[stack.length - 1] || null;
     const parentBlock = [...stack].reverse().find((entry) => entry.block)?.block || null;
     const parentConnectionEntry = [...stack].reverse().find((entry) =>
       entry.name === 'value' || entry.name === 'statement' || entry.name === 'next'
     );
+    let connectionOwner = null;
+    if (name === 'value' || name === 'statement' || name === 'next') {
+      connectionOwner = directParentEntry && directParentEntry.block || null;
+      if (!connectionOwner) {
+        structureErrors.push({ code: 'CONNECTION_OUTSIDE_BLOCK', connection: name, input: attributes.name || null });
+      } else {
+        const key = name === 'next' ? 'next' : `${name}:${attributes.name || ''}`;
+        if (connectionOwner._connectionKeys.has(key)) {
+          structureErrors.push({
+            code: name === 'next' ? 'DUPLICATE_NEXT' : 'DUPLICATE_CONNECTION',
+            owner: { type: connectionOwner.type, id: connectionOwner.id },
+            connection: name,
+            input: attributes.name || null
+          });
+        }
+        connectionOwner._connectionKeys.add(key);
+      }
+    }
     let block = null;
     if (name === 'block' || name === 'shadow') {
+      const directConnection = directParentEntry &&
+        (directParentEntry.name === 'value' || directParentEntry.name === 'statement' || directParentEntry.name === 'next')
+        ? directParentEntry : null;
+      if (directConnection) {
+        directConnection.childBlocks += 1;
+        if (directConnection.name === 'next' && name !== 'block') {
+          structureErrors.push({ code: 'NEXT_REQUIRES_BLOCK', childTag: name });
+        }
+        if (directConnection.name === 'next' && directConnection.childBlocks > 1) {
+          structureErrors.push({ code: 'NEXT_HAS_MULTIPLE_BLOCKS', childBlocks: directConnection.childBlocks });
+        }
+      } else if (parentBlock) {
+        structureErrors.push({
+          code: 'BLOCK_WITHOUT_CONNECTION',
+          owner: { type: parentBlock.type, id: parentBlock.id },
+          child: { type: attributes.type || '', id: attributes.id || '' }
+        });
+      }
       block = {
         tag: name,
         type: attributes.type || '',
@@ -2155,7 +3859,8 @@ function parseProjectXml(projectXml) {
         } : null,
         fields: {},
         mutation: null,
-        args: []
+        args: [],
+        _connectionKeys: new Set()
       };
       blocks.push(block);
       if (block.id) ids.push(block.id);
@@ -2170,12 +3875,22 @@ function parseProjectXml(projectXml) {
         name,
         attributes,
         block,
+        ownerBlock: connectionOwner,
+        childBlocks: name === 'next' ? 0 : undefined,
         owner: name === 'field' ? parentBlock : null,
         text: name === 'field' ? '' : undefined
       });
     }
   }
   if (stack.length) fail(`XML 仍有未闭合标签: ${stack.map((entry) => entry.name).join(', ')}`);
+  for (const block of blocks) delete block._connectionKeys;
+  if (structureErrors.length) {
+    fail('Blockly XML 连接结构无效；不要手写 .mix，请改用 mixly_build_project 的 tree/treePath', {
+      code: 'MIXLY_XML_STRUCTURE_INVALID',
+      structureErrors,
+      hint: '<next> 必须直接位于前一个 block 内并包住唯一的下一个 block；结构树序列化会自动完成嵌套与 XML 转义。'
+    });
+  }
   const duplicateIds = unique(ids.filter((id, index) => ids.indexOf(id) !== index));
   return { blocks, duplicateIds, topBlocks: blocks.filter((block) => !block.parent && block.tag === 'block') };
 }
@@ -2216,18 +3931,20 @@ function sourceForProject(args) {
   if (!args.sourcePath) return null;
   const sourcePath = resolveInputPath(args.sourcePath, args.allowExternalSourcePath === true);
   if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) fail(`源码文件不存在: ${sourcePath}`);
-  return fs.readFileSync(sourcePath, 'utf8');
+  return stripUtf8Bom(fs.readFileSync(sourcePath, 'utf8'));
 }
 
-function projectCompatibility(args, projectXml) {
+async function projectCompatibility(args, projectXml) {
   const rootTag = (String(projectXml).match(/<xml\b[^>]*>/i) || [])[0] || '';
   const boardAttribute = markupAttributes(rootTag).board || '';
   const boardSelector = args.board || boardAttribute;
   if (!boardSelector) fail('无法从工程识别板卡；请显式传 board');
   const board = getBoard(boardSelector);
   const parsed = parseProjectXml(projectXml);
-  const scanned = scanLibrary({
-    board: board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id
+  const scanned = await scanLibrary({
+    board: board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id,
+    cdpPort: args.cdpPort,
+    full: true
   });
   const thirdPartyTypes = unique(scanned.thirdParty.flatMap((library) => library.customTypes));
   const installedTypes = new Set(scanned.availableBlockTypes || [...scanned.blockTypes, ...thirdPartyTypes]);
@@ -2315,24 +4032,26 @@ function atomicWriteProject(projectPath, projectXml, overwrite) {
   return outputPath;
 }
 
-function saveProject(args) {
-  const report = projectCompatibility(args, args.projectXml);
+async function saveProject(args) {
+  const report = await projectCompatibility(args, args.projectXml);
   if (!report.passed) fail('Mixly 工程兼容性检查失败', { ...report, parsed: undefined });
   const projectPath = atomicWriteProject(args.projectPath, args.projectXml, args.overwrite);
+  const livePreview = await previewProjectUpdate(args, projectPath);
   delete report.parsed;
-  return { projectPath, ...report };
+  return { projectPath, livePreview, ...report };
 }
 
-function validateProjectTreeConnections(tree, boardSelector) {
+async function validateProjectTreeConnections(tree, boardSelector) {
   const entries = projectTreeNodeEntries(tree);
   const requestedTypes = unique(entries.map(({ node }) => node.type).filter(Boolean));
   const specs = [];
   for (let index = 0; index < requestedTypes.length; index += 50) {
-    specs.push(...getBlockSpecs({
+    const specificationBatch = await getBlockSpecs({
       board: boardSelector,
       blockTypes: requestedTypes.slice(index, index + 50),
       includeSource: false
-    }).specs);
+    });
+    specs.push(...specificationBatch.specs);
   }
   const reliableSpecs = new Map(specs
     .filter((spec) => spec.definition && !spec.contract.hasMutation)
@@ -2409,7 +4128,7 @@ function validateProjectTreeConnections(tree, boardSelector) {
   };
 }
 
-function buildProject(args) {
+async function buildProject(args) {
   let tree = args.tree;
   if (args.treePath) {
     const treePath = ensureInsideWorkspace(args.treePath);
@@ -2424,11 +4143,12 @@ function buildProject(args) {
       ? `${board.boardType}@${board.selectedProfile}`
       : board.boardType;
   }
-  const treeContractValidation = validateProjectTreeConnections(normalized, args.board);
+  const treeContractValidation = await validateProjectTreeConnections(normalized, args.board);
   const serialized = serializeProjectTree(normalized);
-  const report = projectCompatibility(args, serialized.xml);
+  const report = await projectCompatibility(args, serialized.xml);
   if (!report.passed) fail('结构化积木工程兼容性检查失败', { ...report, parsed: undefined });
   const projectPath = atomicWriteProject(args.projectPath, serialized.xml, args.overwrite);
+  const livePreview = await previewProjectUpdate(args, projectPath);
   delete report.parsed;
   return {
     projectPath,
@@ -2436,6 +4156,7 @@ function buildProject(args) {
     serializedNodes: serialized.nodeCount,
     autoLayout: true,
     globalVariablesChained: true,
+    livePreview,
     treeContractValidation,
     ...report
   };
@@ -2503,10 +4224,25 @@ function parseToolOutput(output) {
   return value;
 }
 
-function inferLibraryBoard(libraryName) {
+async function inferLibraryBoard(libraryName, args = {}) {
   for (const board of getBoardCatalog()) {
     const libraryPath = path.join(board.root, 'libraries', 'ThirdParty', libraryName);
     if (fs.existsSync(libraryPath) && fs.statSync(libraryPath).isDirectory()) return board.id;
+    if (isMixly4() && mixly4LibrarySourceCandidates(board, libraryName).some((candidate) =>
+      fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()
+    )) return board.id;
+  }
+  if (isMixly4()) {
+    for (const board of getBoardCatalog()) {
+      const snapshot = await readMixly4OpfsSnapshot(board, args, {
+        mode: 'analysis', libraryNames: [libraryName]
+      });
+      if (snapshot.available && snapshot.plugins.some((plugin) =>
+        [plugin.id, plugin.name].filter(Boolean).some((name) =>
+          String(name).toLowerCase() === String(libraryName).toLowerCase()
+        )
+      )) return board.id;
+    }
   }
   fail(`无法自动识别积木库所属板卡，请传 board: ${libraryName}`);
 }
@@ -2522,8 +4258,8 @@ function requireLocalDependency(name) {
   fail(`缺少本地依赖 ${name}；请在 MCP 目录执行 npm install`);
 }
 
-async function packageLibrary(args) {
-  const boardName = args.board || inferLibraryBoard(args.library);
+async function packageLegacyLibrary(args) {
+  const boardName = args.board || await inferLibraryBoard(args.library, args);
   const board = getBoard(boardName);
   const sourceDir = path.join(board.root, 'libraries', 'ThirdParty', args.library);
   if (!fs.existsSync(sourceDir) || !fs.statSync(sourceDir).isDirectory()) {
@@ -2567,64 +4303,591 @@ async function packageLibrary(args) {
   };
 }
 
-async function getCdpTargets(cdpPort, timeoutMs = 2000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function packageLibrary(args) {
+  const boardName = args.board || await inferLibraryBoard(args.library, args);
+  const board = getBoard(boardName);
+  const context = await thirdPartyLibraryContext(board, args, {
+    mode: 'full',
+    libraryNames: [args.library]
+  });
   try {
-    const response = await fetch(`http://127.0.0.1:${cdpPort}/json`, { signal: controller.signal });
-    if (!response.ok) throw new Error(`CDP HTTP ${response.status}`);
-    return await response.json();
+    const requestedName = String(args.library).toLowerCase();
+    const resource = context.resources.find((candidate) =>
+      candidate.name.toLowerCase() === requestedName
+    );
+    if (!resource) {
+      if (isMixly4() && !context.storage.available) {
+        fail(`无法读取 Mixly 4 插件并完成打包: ${args.library}`, {
+          code: 'MIXLY4_OPFS_UNAVAILABLE',
+          pluginStorage: context.storage,
+          stagingLibraries: context.resources.map((item) => item.name)
+        });
+      }
+      fail(`积木库不存在: ${args.library}`, {
+        board: board.id,
+        availableLibraries: context.resources.map((item) => item.name),
+        pluginStorage: context.storage
+      });
+    }
+
+    const sourceDir = resource.stagingPath || resource.path;
+    const source = resource.stagingPath ? 'mixly4-staging' : resource.source;
+    const outputPath = ensureInsideWorkspace(
+      args.outputPath || path.join(ROOT, `${args.library}_Mixly_Library.zip`)
+    );
+    const files = filesRecursive(sourceDir)
+      .filter((filePath) => fs.statSync(filePath).isFile())
+      .map((filePath) => ({
+        absolute: filePath,
+        relative: path.relative(sourceDir, filePath).replace(/\\/g, '/')
+      }))
+      .sort((left, right) => left.relative.localeCompare(right.relative));
+    if (!files.length) fail(`积木库没有可打包文件: ${sourceDir}`);
+
+    const archiveRoot = isMixly4() ? '' : `${resource.name}/`;
+    const entries = files.map((file) => `${archiveRoot}${file.relative}`);
+    const directoryEntries = isMixly4()
+      ? unique(entries.flatMap((entry) => {
+          const parts = entry.split('/');
+          return parts.slice(0, -1).map((_, index) => `${parts.slice(0, index + 1).join('/')}/`);
+        })).sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right))
+      : [];
+    const outputDirectory = path.dirname(outputPath);
+    fs.mkdirSync(outputDirectory, { recursive: true });
+    const temporaryPath = `${outputPath}.tmp-${process.pid}-${Date.now()}`;
+    const yazl = requireLocalDependency('yazl');
+    try {
+      await new Promise((resolve, reject) => {
+        const zip = new yazl.ZipFile();
+        const output = fs.createWriteStream(temporaryPath);
+        output.on('close', resolve);
+        output.on('error', reject);
+        zip.outputStream.on('error', reject);
+        zip.outputStream.pipe(output);
+        for (const directory of directoryEntries) zip.addEmptyDirectory(directory);
+        for (let index = 0; index < files.length; index++) {
+          zip.addFile(files[index].absolute, entries[index]);
+        }
+        zip.end();
+      });
+      if (fs.existsSync(outputPath)) fs.rmSync(outputPath, { force: true });
+      fs.renameSync(temporaryPath, outputPath);
+    } finally {
+      if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+    }
+    return {
+      library: resource.name,
+      board: boardName,
+      source,
+      zipPath: outputPath,
+      entries,
+      fileEntries: files.length,
+      directoryEntries: directoryEntries.length,
+      pluginStorage: context.storage
+    };
+  } finally {
+    context.cleanup();
+  }
+}
+
+// Runtime helpers keep the HTTP/NW.js transport separate from the legacy
+// file/Electron transport while sharing target selection and diagnostics.
+function isMixly4(layout = MIXLY_LAYOUT) {
+  return layout && layout.generation === 4 && layout.runtime === 'nwjs';
+}
+
+function mixlyHttpOrigin(layout = MIXLY_LAYOUT) {
+  const main = layout && layout.packageJson && layout.packageJson.main;
+  if (typeof main === 'string' && /^https?:\/\//i.test(main)) {
+    try { return new URL(main).origin; } catch (_) { /* use the known default below */ }
+  }
+  return isMixly4(layout) ? 'http://localhost:65234' : null;
+}
+
+function buildEditorUrl(board, projectPath = '', layout = MIXLY_LAYOUT, appSrcRoot = APP_SRC_ROOT) {
+  const parameters = {
+    thirdPartyBoard: board && board.thirdParty ? 'true' : 'false',
+    boardIndex: board && board.boardIndex || '',
+    boardType: board && board.boardType || '',
+    boardImg: board && board.boardImg || '',
+    language: board && board.language || ''
+  };
+  // Mixly 4 is served by static-server.  A file:// URL bypasses its module
+  // loader and produces misleading Blockly shadow/import errors.
+  if (isMixly4(layout)) {
+    const origin = mixlyHttpOrigin(layout);
+    return `${origin}/boards/index.html?${new URLSearchParams(parameters).toString()}`;
+  }
+  const url = new URL(pathToFileURL(path.join(appSrcRoot, 'boards', 'index.html')).href);
+  if (projectPath) parameters.filePath = projectPath.replace(/\\/g, '/');
+  url.search = new URLSearchParams(parameters).toString();
+  return url.href;
+}
+
+function summarizeCdpTargets(targets) {
+  return (Array.isArray(targets) ? targets : []).map((target) => ({
+    id: target.id || null,
+    type: target.type || null,
+    title: target.title || '',
+    url: target.url || '',
+    origin: (() => {
+      try { return new URL(target.url || '').origin; } catch (_) { return null; }
+    })(),
+    webSocketDebuggerUrl: target.webSocketDebuggerUrl || null
+  }));
+}
+
+function targetScore(target, expectedOrigin) {
+  if (!target || target.type !== 'page' || !target.webSocketDebuggerUrl) return -1;
+  if (/^devtools:\/\//i.test(target.url || '') || /devtools/i.test(target.title || '')) return -1;
+  const value = String(target.url || '');
+  let score = 1;
+  if (/\/boards\/index\.html(?:[?#]|$)/i.test(value)) score += 100;
+  else if (/\/mixvm\/index\.html(?:[?#]|$)/i.test(value)) score += 80;
+  if (expectedOrigin) {
+    try {
+      const actual = new URL(value);
+      const expected = new URL(expectedOrigin);
+      const sameLoopback = actual.protocol === expected.protocol && actual.port === expected.port &&
+        ['localhost', '127.0.0.1', '::1'].includes(actual.hostname) &&
+        ['localhost', '127.0.0.1', '::1'].includes(expected.hostname);
+      if (actual.origin === expectedOrigin || sameLoopback) score += 50;
+      else if (isMixly4()) return -1;
+    } catch (_) {
+      if (isMixly4()) return -1;
+    }
+  }
+  return score;
+}
+
+function selectCdpTarget(targets, expectedOrigin = null) {
+  return (Array.isArray(targets) ? targets : [])
+    .map((target) => ({ target, score: targetScore(target, expectedOrigin) }))
+    .filter((item) => item.score >= 0)
+    .sort((left, right) => right.score - left.score)[0]?.target || null;
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const value = await response.json();
+    if (!Array.isArray(value)) throw new Error('CDP endpoint returned a non-array target list');
+    return value;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function waitForCdp(cdpPort, waitMs) {
-  const deadline = Date.now() + waitMs;
-  let lastError;
+async function getCdpTargets(cdpPort, timeoutMs = 2000) {
+  const endpoints = [
+    `http://127.0.0.1:${cdpPort}/json/list`,
+    `http://127.0.0.1:${cdpPort}/json`,
+    `http://localhost:${cdpPort}/json/list`,
+    `http://localhost:${cdpPort}/json`
+  ];
+  const errors = [];
+  const perEndpointTimeout = Math.max(250, Math.floor(timeoutMs / endpoints.length));
+  for (const endpoint of endpoints) {
+    try {
+      return await fetchJsonWithTimeout(endpoint, perEndpointTimeout);
+    } catch (error) {
+      errors.push({ endpoint, message: error.name === 'AbortError' ? 'timeout' : String(error.message || error) });
+    }
+  }
+  const error = new Error(`CDP endpoint unavailable on port ${cdpPort}`);
+  error.cdpAttempts = errors;
+  throw error;
+}
+
+async function getCdpDiagnostics(cdpPort, timeoutMs = 1200) {
+  try {
+    const targets = await getCdpTargets(cdpPort, timeoutMs);
+    const expectedOrigin = isMixly4() ? mixlyHttpOrigin() : null;
+    const target = selectCdpTarget(targets, expectedOrigin);
+    return {
+      running: true,
+      available: Boolean(target),
+      port: cdpPort,
+      target: target ? summarizeCdpTargets([target])[0] : null,
+      targets: summarizeCdpTargets(targets),
+      reason: target ? null : 'no Mixly page target'
+    };
+  } catch (error) {
+    return {
+      running: false,
+      available: false,
+      port: cdpPort,
+      target: null,
+      targets: [],
+      reason: 'endpoint-unavailable',
+      error: error.message,
+      attempts: error.cdpAttempts || []
+    };
+  }
+}
+
+async function probeMixlyHttp(origin, timeoutMs = 1200) {
+  if (!origin) return { available: false, origin: null, reason: 'not-http-runtime' };
+  const url = `${origin.replace(/\/$/, '')}/boards/index.html`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      return { available: response.ok, origin, url, status: response.status, reason: response.ok ? null : `HTTP ${response.status}` };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    return { available: false, origin, url, reason: error.name === 'AbortError' ? 'timeout' : String(error.message || error) };
+  }
+}
+
+async function waitForHttp(origin, waitMs) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await probeMixlyHttp(origin, Math.min(1200, Math.max(250, deadline - Date.now())));
+    if (last.available) return last;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return last || probeMixlyHttp(origin, 500);
+}
+
+async function waitForCdp(cdpPort, waitMs, options = {}) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  let lastError = null;
   while (Date.now() < deadline) {
     try {
       const targets = await getCdpTargets(cdpPort);
-      if (targets.some((target) => target.type === 'page')) return targets;
+      const selected = selectCdpTarget(targets, isMixly4() ? mixlyHttpOrigin() : null);
+      if (selected) return targets;
     } catch (error) {
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await new Promise((resolve) => setTimeout(resolve, 300));
   }
-  fail(`等待 Mixly CDP 端口 ${cdpPort} 超时`, lastError ? lastError.message : null);
+  if (options.returnNull) return null;
+  fail(`等待 Mixly CDP 端口 ${cdpPort} 超时`, {
+    cdpPort,
+    reason: 'cdpUnavailable',
+    runtime: mixlyLayoutSummary(),
+    httpOrigin: mixlyHttpOrigin(),
+    lastError: lastError ? lastError.message : null,
+    attempts: lastError && lastError.cdpAttempts ? lastError.cdpAttempts : []
+  });
+}
+
+function runtimeAutomation(cdp, http) {
+  return {
+    generation: MIXLY_LAYOUT.generation,
+    runtime: MIXLY_LAYOUT.runtime,
+    httpOrigin: mixlyHttpOrigin(),
+    http,
+    cdp,
+    automation: {
+      available: Boolean(cdp && cdp.available),
+      transport: cdp && cdp.available ? 'cdp' : null,
+      reason: cdp && cdp.available ? null : 'cdpUnavailable'
+    }
+  };
+}
+
+function cdpUnavailable(operation, cdp, http, extra = {}) {
+  fail(`Mixly ${operation} 无法自动化：当前运行时未暴露可用 CDP`, {
+    code: 'MIXLY4_CDP_UNAVAILABLE',
+    operation,
+    runtime: mixlyLayoutSummary(),
+    httpOrigin: mixlyHttpOrigin(),
+    manualUrl: extra.url || `${mixlyHttpOrigin() || ''}/boards/index.html`,
+    cdp,
+    http,
+    hint: 'Mixly 4 普通 NW.js 构建可能不提供 /json 调试端点；请使用带调试端口的 SDK 构建，或在 Mixly 界面手工完成此操作。',
+    ...extra
+  });
+}
+
+async function requireCdpTarget(operation, cdpPort, url = null) {
+  const http = await probeMixlyHttp(mixlyHttpOrigin());
+  const cdp = await getCdpDiagnostics(cdpPort);
+  if (!cdp.target) cdpUnavailable(operation, cdp, http, { url });
+  return { cdp, http, target: cdp.target };
+}
+
+function mixly4BoardPageKey(url) {
+  try {
+    const parsed = new URL(String(url));
+    const boardIndex = String(parsed.searchParams.get('boardIndex') || '')
+      .replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    return boardIndex ? `${parsed.origin}${parsed.pathname}|${boardIndex}` : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function sameMixly4BoardPage(currentUrl, expectedUrl) {
+  const current = mixly4BoardPageKey(currentUrl);
+  const expected = mixly4BoardPageKey(expectedUrl);
+  return Boolean(current && expected && current === expected);
+}
+
+async function navigateMixly4Board(boardSelector, cdpPort, waitMs) {
+  if (!isMixly4() || !boardSelector) return null;
+  const url = projectUrl('', boardSelector);
+  const diagnostics = await getCdpDiagnostics(cdpPort, 700);
+  if (diagnostics.target && sameMixly4BoardPage(diagnostics.target.url, url)) {
+    const workspace = await waitForWorkspace(cdpPort, Number(waitMs || 30000));
+    return { url: diagnostics.target.url, workspace, navigated: false };
+  }
+  await runNodeTool('validate_mixly_workspace.js', ['--navigate', url], {
+    env: {
+      MIXLY_CDP_PORT: String(cdpPort),
+      MIXLY_EXPECTED_ORIGIN: mixlyHttpOrigin() || '',
+      MIXLY_MIXLY4: '1'
+    },
+    timeoutMs: Math.max(30000, Number(waitMs || 30000))
+  });
+  const workspace = await waitForWorkspace(cdpPort, Number(waitMs || 30000));
+  return { url, workspace, navigated: true };
 }
 
 async function launchMixly(args) {
   const cdpPort = getCdpPort(args);
-  try {
-    const targets = await getCdpTargets(cdpPort);
-    return { alreadyRunning: true, cdpPort, targets: targets.map(({ type, title, url }) => ({ type, title, url })) };
-  } catch (_) { /* launch a new isolated instance */ }
+  const waitMs = Number(args.waitMs || 30000);
+  const cdpBefore = await getCdpDiagnostics(cdpPort);
+  const httpOrigin = mixlyHttpOrigin();
+  if (isMixly4()) {
+    const httpBefore = await probeMixlyHttp(httpOrigin);
+    if (httpBefore.available && cdpBefore.available) {
+      const boardPage = await navigateMixly4Board(args.board, cdpPort, waitMs);
+      return {
+        alreadyRunning: true,
+        pid: null,
+        cdpPort,
+        profilePath: null,
+        boardPage,
+        runtime: runtimeAutomation(cdpBefore, httpBefore),
+        targets: cdpBefore.targets
+      };
+    }
+    if (httpBefore.available) {
+      fail('Mixly 4 已启动，但当前实例没有 CDP，MCP 无法自动导入、打开工程或执行 WASM 编译', {
+        code: 'MIXLY4_HTTP_WITHOUT_CDP',
+        http: httpBefore,
+        cdp: cdpBefore,
+        cdpPort,
+        hint: '请关闭当前普通实例后重新调用 mixly_project_workflow；MCP 会优先启动 MIXLY_HOME 内可自动化的 64 位 NW.js/SDK 运行时。'
+      });
+    }
+  } else if (cdpBefore.available) {
+    return { alreadyRunning: true, cdpPort, runtime: runtimeAutomation(cdpBefore, null), targets: cdpBefore.targets };
+  }
 
-  if (!fs.existsSync(MIXLY_EXE)) fail(`找不到 Mixly.exe: ${MIXLY_EXE}`);
+  const runtimeCandidate = preferredMixlyRuntime(args);
+  if (!runtimeCandidate) fail(`找不到可用的 Mixly 运行时: ${MIXLY_EXE}`);
   const profilePath = ensureInsideWorkspace(args.profilePath || path.join(ROOT, '.mixly-mcp-profile'));
   fs.mkdirSync(profilePath, { recursive: true });
-  const child = spawn(MIXLY_EXE, [
-    `--remote-debugging-port=${cdpPort}`,
-    `--user-data-dir=${profilePath}`
-  ], { cwd: ROOT, detached: true, stdio: 'ignore', windowsHide: false });
+  const launchArgs = runtimeCandidate.nwRuntime
+    ? [`--remote-debugging-port=${cdpPort}`, ROOT]
+    : [`--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profilePath}`];
+  const child = spawn(runtimeCandidate.path, launchArgs, {
+    cwd: ROOT, detached: true, stdio: 'ignore', windowsHide: false
+  });
   child.unref();
-  const targets = await waitForCdp(cdpPort, Number(args.waitMs || 30000));
-  return {
-    alreadyRunning: false,
-    pid: child.pid,
-    cdpPort,
-    profilePath,
-    targets: targets.map(({ type, title, url }) => ({ type, title, url }))
-  };
+
+  if (isMixly4()) {
+    const http = await waitForHttp(httpOrigin, waitMs);
+    if (!http || !http.available) {
+      fail('Mixly 4 HTTP 服务启动超时', {
+        code: 'MIXLY4_HTTP_UNAVAILABLE', runtime: mixlyLayoutSummary(), httpOrigin, http,
+        pid: child.pid, profilePath
+      });
+    }
+    await waitForCdp(cdpPort, waitMs);
+    const diagnostics = await getCdpDiagnostics(cdpPort);
+    const boardPage = await navigateMixly4Board(args.board, cdpPort, waitMs);
+    return {
+      alreadyRunning: false,
+      pid: child.pid,
+      cdpPort,
+      profilePath: runtimeCandidate.nwRuntime ? path.join(ROOT, 'nw_cache') : profilePath,
+      requestedProfilePath: profilePath,
+      runtimeExecutable: runtimeCandidate.path,
+      runtimeExecutableSource: runtimeCandidate.source,
+      runtimeArchitecture: runtimeCandidate.architecture,
+      boardPage,
+      runtime: runtimeAutomation(diagnostics, http),
+      targets: diagnostics.targets
+    };
+  }
+  await waitForCdp(cdpPort, waitMs);
+  const diagnostics = await getCdpDiagnostics(cdpPort);
+  return { alreadyRunning: false, pid: child.pid, cdpPort, profilePath, runtime: runtimeAutomation(diagnostics, null), targets: diagnostics.targets };
 }
 
 async function evaluateCdp(expression, cdpPort) {
-  const result = await runNodeTool('validate_mixly_workspace.js', [expression], {
-    env: { MIXLY_CDP_PORT: String(cdpPort) },
-    timeoutMs: COMMAND_TIMEOUT_MS
+  const expressionPath = path.join(
+    os.tmpdir(),
+    `mixly-cdp-expression-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.js`
+  );
+  fs.writeFileSync(expressionPath, String(expression), 'utf8');
+  try {
+    const result = await runNodeTool('validate_mixly_workspace.js', ['--expression-file', expressionPath], {
+      env: {
+        MIXLY_CDP_PORT: String(cdpPort),
+        MIXLY_EXPECTED_ORIGIN: mixlyHttpOrigin() || '',
+        MIXLY_MIXLY4: isMixly4() ? '1' : '0'
+      },
+      timeoutMs: COMMAND_TIMEOUT_MS
+    });
+    return { value: parseToolOutput(result.stdout), raw: result.stdout.trim() };
+  } finally {
+    fs.rmSync(expressionPath, { force: true });
+  }
+}
+
+async function clickCdpSelector(selector, cdpPort) {
+  const result = await runNodeTool('validate_mixly_workspace.js', ['--click-selector', selector], {
+    env: {
+      MIXLY_CDP_PORT: String(cdpPort),
+      MIXLY_EXPECTED_ORIGIN: mixlyHttpOrigin() || '',
+      MIXLY_MIXLY4: isMixly4() ? '1' : '0'
+    },
+    timeoutMs: 30000
   });
-  return { value: parseToolOutput(result.stdout), raw: result.stdout.trim() };
+  return parseToolOutput(result.stdout);
+}
+
+function zipEntries(zipPath) {
+  const stat = fs.statSync(zipPath);
+  if (stat.size > 128 * 1024 * 1024) fail('Mixly 库 ZIP 超过自动导入大小限制', { zipPath, size: stat.size });
+  const data = fs.readFileSync(zipPath);
+  const eocd = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+  const start = Math.max(0, data.length - 0x10000 - 22);
+  const eocdOffset = data.lastIndexOf(eocd, data.length - 22);
+  if (eocdOffset < start) fail('无法读取 ZIP 中央目录', { zipPath });
+  const count = data.readUInt16LE(eocdOffset + 10);
+  const directorySize = data.readUInt32LE(eocdOffset + 12);
+  const directoryOffset = data.readUInt32LE(eocdOffset + 16);
+  if (directoryOffset + directorySize > data.length) fail('ZIP 中央目录越界', { zipPath });
+  const entries = [];
+  let offset = directoryOffset;
+  for (let index = 0; index < count && offset + 46 <= data.length; index++) {
+    if (data.readUInt32LE(offset) !== 0x02014b50) break;
+    const method = data.readUInt16LE(offset + 10);
+    const compressedSize = data.readUInt32LE(offset + 20);
+    const uncompressedSize = data.readUInt32LE(offset + 24);
+    const nameLength = data.readUInt16LE(offset + 28);
+    const extraLength = data.readUInt16LE(offset + 30);
+    const commentLength = data.readUInt16LE(offset + 32);
+    const localOffset = data.readUInt32LE(offset + 42);
+    const name = data.toString('utf8', offset + 46, offset + 46 + nameLength).replace(/\\/g, '/');
+    entries.push({ name, method, compressedSize, uncompressedSize, localOffset });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return { data, entries };
+}
+
+function readZipEntry(zipPath, wantedNames) {
+  const wanted = new Set((Array.isArray(wantedNames) ? wantedNames : [wantedNames])
+    .filter(Boolean).map((name) => String(name).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()));
+  const zip = zipEntries(zipPath);
+  const entry = zip.entries.find((item) => {
+    const name = item.name.replace(/^\.\//, '').toLowerCase();
+    const base = path.posix.basename(name);
+    return wanted.has(name) || wanted.has(base) || [...wanted].some((wantedName) => name.endsWith(`/${wantedName}`));
+  });
+  if (!entry || entry.uncompressedSize > 32 * 1024 * 1024) return null;
+  const data = zip.data;
+  if (entry.localOffset + 30 > data.length || data.readUInt32LE(entry.localOffset) !== 0x04034b50) return null;
+  const nameLength = data.readUInt16LE(entry.localOffset + 26);
+  const extraLength = data.readUInt16LE(entry.localOffset + 28);
+  const payloadStart = entry.localOffset + 30 + nameLength + extraLength;
+  const payloadEnd = payloadStart + entry.compressedSize;
+  if (payloadEnd > data.length) return null;
+  const payload = data.subarray(payloadStart, payloadEnd);
+  if (entry.method === 0) return Buffer.from(payload);
+  if (entry.method === 8) return zlib.inflateRawSync(payload);
+  return null;
+}
+
+function mixly4PluginMetadata(zipPath, libraryName) {
+  const metadataEntry = readZipEntry(zipPath, ['plugin.json', 'package.json']);
+  let metadata = {};
+  if (metadataEntry) {
+    try { metadata = JSON.parse(stripUtf8Bom(metadataEntry.toString('utf8'))); } catch (error) {
+      fail('Mixly 4 插件元数据不是有效 JSON', { zipPath, error: error.message });
+    }
+  }
+  const indexXml = readZipEntry(zipPath, ['index.xml']);
+  if (!indexXml) {
+    fail('Mixly 4 导入要求 ZIP 包含 index.xml；旧版仅 Arduino 库 ZIP 不能直接作为插件导入', {
+      code: 'MIXLY4_PLUGIN_FORMAT_REQUIRED', zipPath, libraryName
+    });
+  }
+  const id = String(metadata.id || metadata.name || libraryName || '').trim();
+  if (!/^[A-Za-z][A-Za-z0-9_.-]{1,63}$/.test(id)) {
+    fail('Mixly 4 插件 id 不合法', { code: 'MIXLY4_PLUGIN_METADATA_REQUIRED', zipPath, id });
+  }
+  const version = String(metadata.version || metadata.latestVersion || '0.0.0').trim();
+  return {
+    ...metadata,
+    id,
+    // Keep dir in sync with the id-based storage directory; without it the
+    // MicroPython uploader joins an undefined segment and skips or breaks
+    // the plugin libraries mount.
+    dir: String(metadata.dir || id).trim() || id,
+    name: metadata.name || id,
+    displayName: metadata.displayName || metadata.title || metadata.name || id,
+    version,
+    latestVersion: metadata.latestVersion || version,
+    currentVersion: metadata.currentVersion || version
+  };
+}
+
+async function importMixly4Plugin(args, zipPath, libraryName) {
+  const url = args.board ? projectUrl('', args.board) : null;
+  const { cdp, http } = await requireCdpTarget('库导入', getCdpPort(args), url);
+  if (url) {
+    await navigateMixly4Board(args.board, getCdpPort(args), Number(args.waitMs || 30000));
+  }
+  const metadata = mixly4PluginMetadata(zipPath, libraryName);
+  const base64 = fs.readFileSync(zipPath).toString('base64');
+  if (base64.length > 170 * 1024 * 1024) {
+    fail('Mixly 4 插件 ZIP 过大，拒绝通过 CDP 内联传输', { code: 'MIXLY4_PLUGIN_TOO_LARGE', zipPath });
+  }
+  const expression = `new Promise(async(resolve,reject)=>{try{
+    const raw=atob(${JSON.stringify(base64)});
+    const bytes=new Uint8Array(raw.length);
+    for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+    const blob=new Blob([bytes],{type:'application/zip'});
+    const manager=Mixly.PluginManager||Mixly.StatusBarPlugin;
+    if(!manager||typeof manager.installPlugin!=='function')throw new Error('Mixly.PluginManager.installPlugin is unavailable');
+    const metadata=${JSON.stringify(metadata)};
+    // Mixly 4 creates the storage-rule root but not nested parent folders.
+    // Supply a rule handler so real Arduino library layouts can be installed.
+    metadata.storageRules=(metadata.storageRules||[]).map((rule)=>{
+      if(!rule||rule.type!=='directory')return rule;
+      return {...rule,handler:async({blob,storagePath,fs})=>{
+        const normalized=String(storagePath||'').replaceAll('\\\\','/');
+        const separator=normalized.lastIndexOf('/');
+        if(separator>0)await fs.createDirectory(normalized.slice(0,separator),{recursive:true});
+        await fs.writeFile(storagePath,await blob.arrayBuffer());
+        return storagePath;
+      }};
+    });
+    const result=await manager.installPlugin(metadata,${JSON.stringify(metadata.version)},blob,'install',{});
+    if(typeof manager.mountInstalledPlugin==='function')await manager.mountInstalledPlugin(${JSON.stringify(metadata.id)});
+    resolve(JSON.stringify({id:${JSON.stringify(metadata.id)},version:${JSON.stringify(metadata.version)},installed:true,result}));
+  }catch(error){reject(error)}})`;
+  const evaluated = await evaluateCdp(expression, getCdpPort(args));
+  if (!evaluated.value || evaluated.value.installed !== true) {
+    fail('Mixly 4 插件导入失败', { cdp, http, raw: evaluated.raw, metadata });
+  }
+  return { zipPath, libraryName, format: 'mixly4-plugin', metadata, ...evaluated.value };
 }
 
 async function importLibrary(args) {
@@ -2634,6 +4897,11 @@ async function importLibrary(args) {
   }
   const inferredName = path.basename(zipPath).replace(/_Mixly_Library\.zip$/i, '').replace(/\.zip$/i, '');
   const libraryName = args.libraryName || inferredName;
+  if (isMixly4()) {
+    const result = await importMixly4Plugin(args, zipPath, libraryName);
+    invalidateDiscoveryCaches();
+    return result;
+  }
   const cdpPort = getCdpPort(args);
   if (args.board) {
     const url = projectUrl('', args.board);
@@ -2647,44 +4915,38 @@ async function importLibrary(args) {
   if (!evaluated.value || evaluated.value.error) {
     fail('Mixly 积木库导入失败', evaluated.value || evaluated.raw);
   }
+  invalidateDiscoveryCaches();
   return { zipPath, libraryName, ...evaluated.value };
 }
 
 function projectUrl(projectPath, boardName) {
-  const board = getBoard(boardName);
-  const url = new URL(pathToFileURL(path.join(
-    APP_SRC_ROOT, 'boards', 'index.html'
-  )).href);
-  const parameters = {
-    thirdPartyBoard: board.thirdParty ? 'true' : 'false',
-    boardIndex: board.boardIndex,
-    boardType: board.boardType,
-    boardImg: board.boardImg,
-    language: board.language
-  };
-  if (projectPath) parameters.filePath = projectPath.replace(/\\/g, '/');
-  url.search = new URLSearchParams(parameters).toString();
-  return url.href;
+  return buildEditorUrl(getBoard(boardName), projectPath, MIXLY_LAYOUT, APP_SRC_ROOT);
 }
 
 async function waitForWorkspace(cdpPort, waitMs) {
-  const deadline = Date.now() + waitMs;
-  let lastError;
+  const deadline = Date.now() + Math.max(0, waitMs);
+  let lastError = null;
+  let lastState = null;
   while (Date.now() < deadline) {
     try {
       const evaluated = await evaluateCdp(
-        `JSON.stringify({ready:document.readyState,blockly:typeof Blockly,mixly:typeof Mixly,board:(typeof Mixly==='object'&&Mixly.Boards)?Mixly.Boards.getSelectedBoardName():null,url:location.href})`,
+        `(()=>{const app=(typeof Mixly==='object'&&Mixly.app)||((typeof window==='object'&&window.MixlyApp)||null);const editors=app&&typeof app.getWorkspace==='function'?app.getWorkspace().getEditorsManager():null;const active=editors&&typeof editors.getActive==='function'?editors.getActive():null;const page=active&&typeof active.getPage==='function'?active.getPage('block'):null;const workspace=page&&typeof page.getEditor==='function'?page.getEditor():(typeof Blockly==='object'&&typeof Blockly.getMainWorkspace==='function'?Blockly.getMainWorkspace():null);return JSON.stringify({ready:document.readyState,blockly:typeof Blockly,mixly:typeof Mixly,workspaceReady:Boolean(workspace&&typeof workspace.getAllBlocks==='function'),editorReady:Boolean(active&&typeof active.setValue==='function'),board:(typeof Mixly==='object'&&Mixly.Boards&&typeof Mixly.Boards.getSelectedBoardName==='function')?Mixly.Boards.getSelectedBoardName():null,url:location.href});})()`,
         cdpPort
       );
-      if (evaluated.value && evaluated.value.ready === 'complete' && evaluated.value.blockly === 'object') {
-        return evaluated.value;
+      lastState = evaluated.value;
+      if (lastState && lastState.ready === 'complete' && lastState.blockly === 'object' && lastState.workspaceReady === true) {
+        return lastState;
       }
     } catch (error) {
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 400));
   }
-  fail('等待 Mixly Blockly 工作区就绪超时', lastError ? lastError.message : null);
+  const cdp = await getCdpDiagnostics(cdpPort, 500);
+  fail('等待 Mixly Blockly 工作区就绪超时', {
+    code: 'MIXLY_WORKSPACE_TIMEOUT', runtime: mixlyLayoutSummary(), cdp,
+    lastState, lastError: lastError ? lastError.message : null
+  });
 }
 
 async function openProject(args) {
@@ -2692,16 +4954,96 @@ async function openProject(args) {
   if (!fs.existsSync(projectPath)) fail(`Mixly 工程不存在: ${projectPath}`);
   const cdpPort = getCdpPort(args);
   const url = projectUrl(projectPath, args.board);
-  await runNodeTool('validate_mixly_workspace.js', ['--navigate', url], {
-    env: { MIXLY_CDP_PORT: String(cdpPort) }
-  });
+  const runtime = isMixly4() ? await requireCdpTarget('project-open', cdpPort, url) : null;
+  if (isMixly4()) {
+    await navigateMixly4Board(args.board, cdpPort, Number(args.waitMs || 30000));
+  } else {
+    await runNodeTool('validate_mixly_workspace.js', ['--navigate', url], {
+      env: {
+        MIXLY_CDP_PORT: String(cdpPort),
+        MIXLY_EXPECTED_ORIGIN: mixlyHttpOrigin() || '',
+        MIXLY_MIXLY4: '0'
+      }
+    });
+  }
   const workspace = await waitForWorkspace(cdpPort, Number(args.waitMs || 30000));
-  return { projectPath, board: args.board, cdpPort, url, workspace };
+  let loaded = null;
+  if (isMixly4()) {
+    const evaluated = await evaluateCdp(loadProjectExpression(projectPath,
+      `return JSON.stringify({loaded:true,totalNodes:workspace.getAllBlocks(false).length,url:location.href});`
+    ), cdpPort);
+    loaded = evaluated.value || { loaded: false, raw: evaluated.raw };
+  }
+  return { projectPath, board: args.board, cdpPort, url, workspace, loaded, runtime: runtime ? runtime.cdp : null };
 }
 
+async function previewProjectUpdate(args, projectPath) {
+  if (!isMixly4()) return { enabled: false, updated: false, reason: 'mixly-generation-not-4' };
+  if (args.livePreview === false) return { enabled: false, updated: false, reason: 'explicitly-disabled' };
+  if (args.livePreview !== true && !process.env.MIXLY_CDP_PORT) {
+    return { enabled: false, updated: false, reason: 'harness-cdp-not-pinned' };
+  }
+  const cdpPort = getCdpPort(args);
+  const diagnostics = await getCdpDiagnostics(cdpPort, 500);
+  if (!diagnostics.available) {
+    const result = { enabled: true, updated: false, reason: 'cdp-unavailable', cdpPort };
+    if (args.livePreview === true) fail('Mixly 4 实时积木预览不可用', result);
+    return result;
+  }
+  try {
+    const expectedUrl = projectUrl('', args.board);
+    const currentUrl = diagnostics.target && diagnostics.target.url;
+    if (!sameMixly4BoardPage(currentUrl, expectedUrl)) {
+      const mismatch = {
+        enabled: true,
+        updated: false,
+        cdpPort,
+        reason: 'active-board-mismatch',
+        currentUrl,
+        expectedUrl,
+        hint: '实时预览不会自动切换板卡，以免刷新页面并关闭 AI 侧栏。请先在 Mixly 选择目标板卡。'
+      };
+      if (args.livePreview === true) fail('Mixly 4 实时预览板卡与当前页面不一致', mismatch);
+      return mismatch;
+    }
+    await waitForWorkspace(cdpPort, Number(args.waitMs || 30000));
+    const evaluated = await evaluateCdp(loadProjectExpression(projectPath,
+      `return JSON.stringify({loaded:true,totalNodes:workspace.getAllBlocks(false).length,url:location.href});`
+    ), cdpPort);
+    const loaded = evaluated.value || { loaded: false, raw: evaluated.raw };
+    const expectedNodes = parseProjectXml(fs.readFileSync(projectPath, 'utf8')).blocks.length;
+    const loadedNodes = loaded && loaded.totalNodes;
+    const updated = Boolean(loaded && loaded.loaded && loadedNodes === expectedNodes);
+    const result = {
+      enabled: true,
+      updated,
+      cdpPort,
+      board: args.board,
+      expectedNodes,
+      totalNodes: loadedNodes,
+      reason: updated ? null : 'loaded-node-count-mismatch',
+      url: currentUrl,
+      navigated: false
+    };
+    if (!updated && args.livePreview === true) fail('Mixly 4 实时积木预览节点不完整', result);
+    return result;
+  } catch (error) {
+    if (args.livePreview === true) throw error;
+    return { enabled: true, updated: false, cdpPort, reason: error.message || String(error) };
+  }
+}
+
+// Mixly 4 runs in web mode even though the host is NW.js.  Reading the
+// project in the MCP process and passing its XML to EditorMix avoids relying
+// on the removed Mixly.require/Electron bridge and also works over CDP.
 function loadProjectExpression(projectPath, body) {
-  const encodedPath = JSON.stringify(projectPath.replace(/\\/g, '/'));
-  return `(()=>{const fs=Mixly.require('fs');const source=fs.readFileSync(${encodedPath},'utf8');const dom=Blockly.utils.xml.textToDom(source);const workspace=Blockly.getMainWorkspace();Blockly.Xml.clearWorkspaceAndLoadFromXml(dom,workspace);${body}})()`;
+  if (!isMixly4()) {
+    const encodedPath = JSON.stringify(projectPath.replace(/\\/g, '/'));
+    return `(()=>{const fs=Mixly.require('fs');const source=fs.readFileSync(${encodedPath},'utf8');const dom=Blockly.utils.xml.textToDom(source);const workspace=Blockly.getMainWorkspace();if(!workspace||typeof workspace.setResizesEnabled!=='function')throw new Error('Blockly workspace is not ready');Blockly.Xml.clearWorkspaceAndLoadFromXml(dom,workspace);${body}})()`;
+  }
+  const source = fs.readFileSync(projectPath, 'utf8');
+  const extension = path.extname(projectPath).toLowerCase() || '.mix';
+  return `(async()=>{const source=${JSON.stringify(source)};const extension=${JSON.stringify(extension)};const app=(typeof Mixly==='object'&&Mixly.app)||((typeof window==='object'&&window.MixlyApp)||null);const editors=app&&typeof app.getWorkspace==='function'?app.getWorkspace().getEditorsManager():null;const active=editors&&typeof editors.getActive==='function'?editors.getActive():null;const blockEditor=active&&typeof active.getPage==='function'&&active.getPage('block')?active.getPage('block').getEditor():null;if(active&&typeof active.setValue==='function'){active.setValue(source,extension)}else{const workspace=blockEditor||(typeof Blockly==='object'&&typeof Blockly.getMainWorkspace==='function'?Blockly.getMainWorkspace():null);if(!workspace)throw new Error('Mixly 4 block editor is not ready');const dom=Blockly.utils.xml.textToDom(source);Blockly.Xml.clearWorkspaceAndLoadFromXml(dom,workspace)}await new Promise((resolve)=>setTimeout(resolve,80));const workspace=blockEditor||(typeof Blockly==='object'&&typeof Blockly.getMainWorkspace==='function'?Blockly.getMainWorkspace():null);if(!workspace||typeof workspace.getAllBlocks!=='function')throw new Error('Mixly 4 Blockly workspace is not ready');const topBlocks=typeof workspace.getTopBlocks==='function'?workspace.getTopBlocks(true):[];if(topBlocks.length&&typeof workspace.centerOnBlock==='function'){workspace.centerOnBlock(topBlocks[0].id);await new Promise((resolve)=>requestAnimationFrame(resolve));const panel=document.getElementById('mixly-harness-panel');if(panel&&panel.dataset.open==='true'&&typeof workspace.scroll==='function'){const panelWidth=panel.getBoundingClientRect().width;if(panelWidth>0)workspace.scroll(workspace.scrollX-panelWidth/2,workspace.scrollY)}}${body}})()`;
 }
 
 function projectLoadDiagnostics(parsed, liveBlocks) {
@@ -2748,9 +5090,11 @@ function projectLoadDiagnostics(parsed, liveBlocks) {
 async function validateProject(args) {
   const projectPath = ensureInsideWorkspace(args.projectPath);
   if (!fs.existsSync(projectPath)) fail(`Mixly 工程不存在: ${projectPath}`);
+  if (isMixly4()) await requireCdpTarget('project-validation', getCdpPort(args));
+  await waitForWorkspace(getCdpPort(args), 30000);
   const prefixes = args.customPrefixes || [];
   const projectXml = fs.readFileSync(projectPath, 'utf8');
-  const staticReport = projectCompatibility(args, projectXml);
+  const staticReport = await projectCompatibility(args, projectXml);
   if (!staticReport.passed) fail('Mixly 工程静态兼容性检查失败', { ...staticReport, parsed: undefined });
   const expression = loadProjectExpression(projectPath,
     `workspace.zoomToFit();const blocks=workspace.getAllBlocks(false);const top=workspace.getTopBlocks(false);const prefixes=${JSON.stringify(prefixes)};const custom=blocks.filter((block)=>prefixes.some((prefix)=>block.type.startsWith(prefix)));const rects=top.map((block)=>{const p=block.getRelativeToSurfaceXY();const s=block.getHeightWidth();return{id:block.id,type:block.type,x:p.x,y:p.y,width:s.width,height:s.height};});const overlaps=[];for(let i=0;i<rects.length;i++){for(let j=i+1;j<rects.length;j++){const a=rects[i],b=rects[j];if(a.x<b.x+b.width&&a.x+a.width>b.x&&a.y<b.y+b.height&&a.y+a.height>b.y)overlaps.push([a.id,b.id]);}}const orphanValues=top.filter((block)=>block.outputConnection).map((block)=>({id:block.id,type:block.type}));const topVariables=top.filter((block)=>block.type==='variables_declare').map((block)=>block.id);const blockInventory=blocks.map((block)=>{const parent=block.getParent();return{id:block.id,type:block.type,parent:parent?{id:parent.id,type:parent.type}:null};});return JSON.stringify({ready:document.readyState,title:document.title,board:Mixly.Boards.getSelectedBoardName(),totalNodes:blocks.length,nativeNodes:blocks.length-custom.length,customNodes:custom.length,customTypes:[...new Set(custom.map((block)=>block.type))].sort(),procedures:blocks.filter((block)=>block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn').map((block)=>block.getFieldValue('NAME')).sort(),chineseProcedures:blocks.filter((block)=>(block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn')&&/[\\u3400-\\u9fff]/.test(block.getFieldValue('NAME')||'')).map((block)=>block.getFieldValue('NAME')).sort(),thirdPartyXmlCount:(Mixly.Env.thirdPartyXML||[]).length,scale:workspace.scale,topLevelBlocks:top.length,topVariableDeclarationStacks:topVariables.length,orphanValues,rects,overlaps,blockInventory});`
@@ -2793,10 +5137,30 @@ async function validateProject(args) {
   };
 }
 
+async function generateMixly4Code(args, projectPath, outputPath) {
+  const cdpPort = getCdpPort(args);
+  await requireCdpTarget('code-generation', cdpPort);
+  await waitForWorkspace(cdpPort, Number(args.waitMs || 30000));
+  const expression = loadProjectExpression(projectPath,
+    `const requested=${JSON.stringify(args.generator || '')};let generatorName='';let code='';if(!requested&&active&&typeof active.getCode==='function'){generatorName='Mixly.EditorMix';code=String(active.getCode()||'')}else{const preferred=requested?[requested]:['generator','Arduino','C','C++','Python','MicroPython','MicroPythonV2','JavaScript','Lua'];generatorName=preferred.find((name)=>Blockly[name]&&typeof Blockly[name].workspaceToCode==='function')||'';if(!generatorName)throw new Error('No Blockly code generator is available for the current Mixly 4 board');code=String(Blockly[generatorName].workspaceToCode(workspace)||'')}const blocks=workspace.getAllBlocks(false);return JSON.stringify({code,generator:generatorName,codeLength:code.length,totalNodes:blocks.length,procedures:blocks.filter((block)=>block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn').map((block)=>block.getFieldValue('NAME')).sort()});`
+  );
+  const evaluated = await evaluateCdp(expression, cdpPort);
+  if (!evaluated.value || typeof evaluated.value.code !== 'string') {
+    fail('Mixly 4 code generation failed', { raw: evaluated.raw, projectPath });
+  }
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, evaluated.value.code, 'utf8');
+  const result = { ...evaluated.value };
+  delete result.code;
+  return { projectPath, outputPath, ...result };
+}
+
 async function generateCode(args) {
   const projectPath = ensureInsideWorkspace(args.projectPath);
   const outputPath = ensureInsideWorkspace(args.outputPath);
   if (!fs.existsSync(projectPath)) fail(`Mixly 工程不存在: ${projectPath}`);
+  if (isMixly4()) return generateMixly4Code(args, projectPath, outputPath);
+  await waitForWorkspace(getCdpPort(args), 30000);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   const expression = loadProjectExpression(projectPath,
     `const requested=${JSON.stringify(args.generator || '')};const preferred=requested?[requested]:['Arduino','Python','MicroPython','MicroPythonV2','JavaScript','Lua'];const generatorName=[...preferred,...Object.keys(Blockly)].find((name)=>Blockly[name]&&typeof Blockly[name].workspaceToCode==='function');if(!generatorName)throw new Error('No Blockly code generator is available for the current board');const code=Blockly[generatorName].workspaceToCode(workspace);fs.writeFileSync(${JSON.stringify(outputPath.replace(/\\/g, '/'))},code,'utf8');const blocks=workspace.getAllBlocks(false);return JSON.stringify({outputPath:${JSON.stringify(outputPath.replace(/\\/g, '/'))},generator:generatorName,codeLength:code.length,totalNodes:blocks.length,procedures:blocks.filter((block)=>block.type==='procedures_defnoreturn'||block.type==='procedures_defreturn').map((block)=>block.getFieldValue('NAME')).sort()});`
@@ -2808,6 +5172,277 @@ async function generateCode(args) {
   return { projectPath, ...evaluated.value };
 }
 
+function projectBlockTypes(projectPath) {
+  const parsed = parseProjectXml(fs.readFileSync(projectPath, 'utf8'));
+  return unique(parsed.blocks.map((block) => block.type).filter(Boolean)).sort();
+}
+
+async function prepareWorkflowLibraries(args, board, boardSelector, projectPath) {
+  if (!isMixly4()) {
+    return {
+      applicable: false,
+      reason: 'Mixly 2/3 use their existing ThirdParty import model',
+      imported: [],
+      reused: []
+    };
+  }
+  const cdpPort = getCdpPort(args);
+  const blockTypes = projectBlockTypes(projectPath);
+  const inferredNames = [];
+  if (args.autoImportLibraries !== false) {
+    for (let index = 0; index < blockTypes.length; index += 50) {
+      const specs = await getBlockSpecs({
+        board: boardSelector,
+        blockTypes: blockTypes.slice(index, index + 50),
+        includeSource: false,
+        cdpPort
+      });
+      for (const spec of specs.specs || []) {
+        const match = /^Plugin\/(.+)$/.exec(String(spec.owner || ''));
+        if (match) inferredNames.push(match[1]);
+      }
+    }
+  }
+  const requestedNames = unique([
+    ...inferredNames,
+    ...(Array.isArray(args.libraryNames) ? args.libraryNames : []),
+    ...(Array.isArray(args.mixlyLibraries) ? args.mixlyLibraries : [])
+  ].map((name) => String(name).trim()).filter(Boolean));
+  for (const name of requestedNames) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{1,63}$/.test(name)) fail(`Mixly 4 工作流插件名不合法: ${name}`);
+  }
+
+  const context = await thirdPartyLibraryContext(board, { ...args, cdpPort }, {
+    mode: 'analysis',
+    libraryNames: requestedNames
+  });
+  let resources;
+  try {
+    resources = context.resources.map((resource) => ({
+      name: resource.name,
+      source: resource.source,
+      installed: resource.installed === true,
+      path: resource.path,
+      stagingPath: resource.stagingPath || (resource.source === 'mixly4-staging' ? resource.path : null),
+      version: resource.version || resource.metadata?.version || null
+    }));
+  } finally {
+    context.cleanup();
+  }
+
+  const imported = [];
+  const reused = [];
+  const packageRoot = path.join(MIXLY4_STAGING_DIR, 'packages', mixly4BoardStorageKey(board));
+  for (const name of requestedNames) {
+    const resource = resources.find((item) => item.name.toLowerCase() === name.toLowerCase());
+    if (!resource) {
+      fail(`Mixly 4 工作流找不到工程所需插件: ${name}`, {
+        code: 'MIXLY4_WORKFLOW_LIBRARY_MISSING',
+        projectPath,
+        blockTypes,
+        requestedNames,
+        availableLibraries: resources.map((item) => item.name)
+      });
+    }
+    if (!resource.stagingPath) {
+      reused.push({ name: resource.name, source: resource.source, version: resource.version });
+      continue;
+    }
+    const zipPath = path.join(packageRoot, `${resource.name}.zip`);
+    const packaged = await packageLibrary({
+      board: boardSelector,
+      library: resource.name,
+      outputPath: zipPath,
+      cdpPort
+    });
+    const installed = await importLibrary({
+      zipPath,
+      libraryName: resource.name,
+      board: boardSelector,
+      cdpPort,
+      waitMs: args.waitMs
+    });
+    imported.push({
+      name: resource.name,
+      inferredFromProject: inferredNames.includes(resource.name),
+      zipPath,
+      packaged: {
+        source: packaged.source,
+        fileEntries: packaged.fileEntries,
+        directoryEntries: packaged.directoryEntries,
+        entries: packaged.entries
+      },
+      installed: {
+        format: installed.format,
+        id: installed.id || installed.metadata?.id || resource.name,
+        version: installed.version || installed.metadata?.version || null,
+        installed: installed.installed === true
+      }
+    });
+  }
+
+  for (const zipInput of Array.isArray(args.libraryZipPaths) ? args.libraryZipPaths : []) {
+    const zipPath = ensureInsideWorkspace(zipInput);
+    const installed = await importLibrary({
+      zipPath,
+      board: boardSelector,
+      cdpPort,
+      waitMs: args.waitMs
+    });
+    imported.push({
+      name: installed.libraryName,
+      inferredFromProject: false,
+      zipPath,
+      packaged: null,
+      installed: {
+        format: installed.format || null,
+        id: installed.id || installed.metadata?.id || installed.libraryName,
+        version: installed.version || installed.metadata?.version || null,
+        installed: installed.installed !== false
+      }
+    });
+  }
+
+  return {
+    applicable: true,
+    autoImport: args.autoImportLibraries !== false,
+    projectBlockTypes: blockTypes,
+    inferredNames: unique(inferredNames),
+    requestedNames,
+    imported,
+    reused
+  };
+}
+
+function mixly4DesktopCompileStateExpression() {
+  return `(()=>{
+    const selector='#arduino-compile-btn,[data-id="arduino-compile-btn"],[m-id="arduino-compile-btn"]';
+    const buttons=Array.from(document.querySelectorAll(selector));
+    const button=buttons.find((candidate)=>{const style=getComputedStyle(candidate);const rect=candidate.getBoundingClientRect();return rect.width>=2&&rect.height>=2&&style.display!=='none'&&style.visibility!=='hidden'})||buttons[0]||null;
+    const manager=Mixly.app.getContext().getService('StatusBarsManager');
+    const bar=manager&&manager.getStatusBarById('output');
+    let output='';
+    if(bar){
+      if(typeof bar.getValue==='function')output=String(bar.getValue()||'');
+      else {const editor=typeof bar.getEditor==='function'?bar.getEditor():bar.editor;output=editor&&typeof editor.getValue==='function'?String(editor.getValue()||''):String(bar.$dom&&bar.$dom.innerText||'');}
+    }
+    const generator=(typeof Blockly==='object'&&(Blockly.generator||Blockly.Arduino))||{};
+    const workspace=typeof Blockly==='object'&&typeof Blockly.getMainWorkspace==='function'?Blockly.getMainWorkspace():null;
+    const rect=button&&button.getBoundingClientRect();
+    return JSON.stringify({title:document.title,buttonFound:Boolean(button),buttonVisible:Boolean(rect&&rect.width>=2&&rect.height>=2),buttonDisabled:Boolean(button&&button.disabled),output,blockCount:workspace?workspace.getAllBlocks(false).length:0,sketchFiles:Object.keys(generator.libs_||{})});
+  })()`;
+}
+
+async function compileMixly4Desktop(args) {
+  if (!isMixly4()) return { applicable: false, reason: 'not-mixly4' };
+  const cdpPort = getCdpPort(args);
+  const timeoutMs = Number(args.desktopCompileTimeoutMs || 300000);
+  await requireCdpTarget('桌面 WASM 编译', cdpPort);
+  await waitForWorkspace(cdpPort, Number(args.waitMs || 30000));
+  let before = (await evaluateCdp(mixly4DesktopCompileStateExpression(), cdpPort)).value;
+  if (before && before.buttonFound && !before.buttonVisible) {
+    try {
+      await clickCdpSelector('li.layui-nav-item.mixly-scrollbar > a', cdpPort);
+    } catch (_) {
+      await evaluateCdp(`(()=>{const more=Array.from(document.querySelectorAll('a,button,[role="button"]')).find((node)=>/^(?:更多|more)/i.test((node.innerText||node.title||node.getAttribute('aria-label')||'').trim()));if(more){more.click();return true}return false})()`, cdpPort);
+    }
+    const menuDeadline = Date.now() + 3000;
+    while (Date.now() < menuDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      before = (await evaluateCdp(mixly4DesktopCompileStateExpression(), cdpPort)).value;
+      if (before && before.buttonVisible) break;
+    }
+  }
+  if (!before || !before.buttonFound || !before.buttonVisible || before.buttonDisabled) {
+    fail('Mixly 4 当前板卡没有可点击的桌面编译按钮', {
+      code: 'MIXLY4_WASM_COMPILE_BUTTON_UNAVAILABLE',
+      state: before
+    });
+  }
+  const compileSelector = '#arduino-compile-btn,[data-id="arduino-compile-btn"],[m-id="arduino-compile-btn"]';
+  let click = await clickCdpSelector(compileSelector, cdpPort);
+  let clickState = before;
+  const clickConfirmationDeadline = Date.now() + 1500;
+  while (Date.now() < clickConfirmationDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    clickState = (await evaluateCdp(mixly4DesktopCompileStateExpression(), cdpPort)).value;
+    if (clickState && clickState.output !== before.output) break;
+  }
+  if (!clickState || clickState.output === before.output) {
+    const fallback = await evaluateCdp(`(()=>{const selector=${JSON.stringify(compileSelector)};const buttons=Array.from(document.querySelectorAll(selector));const button=buttons.find((candidate)=>{const style=getComputedStyle(candidate);const rect=candidate.getBoundingClientRect();return rect.width>=2&&rect.height>=2&&style.display!=='none'&&style.visibility!=='hidden'&&!candidate.disabled});if(!button)return JSON.stringify({clicked:false,method:'HTMLElement.click'});button.click();return JSON.stringify({clicked:true,method:'HTMLElement.click',tag:button.tagName,text:String(button.innerText||'').trim()})})()`, cdpPort);
+    if (!fallback.value || fallback.value.clicked !== true) {
+      fail('Mixly 4 编译按钮点击后没有启动编译', {
+        code: 'MIXLY4_WASM_COMPILE_CLICK_UNCONFIRMED',
+        primaryClick: click,
+        fallback: fallback.value || fallback.raw,
+        state: clickState
+      });
+    }
+    click = {
+      ...click,
+      method: 'Input.dispatchMouseEvent+HTMLElement.click-fallback',
+      fallback: fallback.value
+    };
+  } else {
+    click = { ...click, confirmedByOutput: true };
+  }
+  const startedAt = Date.now();
+  let changed = Boolean(clickState && clickState.output !== before.output);
+  let runningSeen = Boolean(clickState && /(?:编译中|compil(?:e|ing)|loading .*compiler)/i.test(clickState.output || ''));
+  let state = clickState || before;
+  while (Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    try {
+      state = (await evaluateCdp(mixly4DesktopCompileStateExpression(), cdpPort)).value;
+    } catch (error) {
+      fail('Mixly 4 在桌面 WASM 编译期间退出或失去响应', {
+        code: 'MIXLY4_WASM_HOST_EXITED',
+        elapsedMs: Date.now() - startedAt,
+        error: error.message
+      });
+    }
+    const output = String(state && state.output || '');
+    changed = changed || output !== String(before.output || '');
+    runningSeen = runningSeen || /编译中|compil(?:e|ing)|linking|resolving libraries/i.test(output);
+    const success = /==\s*编译成功\s*==|==[^=]*compile\s*success[^=]*==/i.test(output);
+    const failed = /==\s*编译失败\s*==|==[^=]*compile\s*fail(?:ed|ure)[^=]*==/i.test(output);
+    if (failed) {
+      fail('Mixly 4 桌面 WASM 编译失败', {
+        code: 'MIXLY4_WASM_COMPILE_FAILED',
+        click,
+        elapsedMs: Date.now() - startedAt,
+        output
+      });
+    }
+    if (success && (changed || runningSeen || Date.now() - startedAt >= 1500)) {
+      const metrics = compileMetrics(output);
+      return {
+        applicable: true,
+        passed: true,
+        engine: 'browser-wasm',
+        validationScope: 'mixly4-visible-desktop-compile',
+        desktopEquivalent: true,
+        click,
+        title: state.title,
+        blockCount: state.blockCount,
+        sketchFiles: state.sketchFiles,
+        elapsedMs: Date.now() - startedAt,
+        output: output.length > 6000 ? output.slice(-6000) : output,
+        metrics,
+        resourceRisk: compileResourceRisk(metrics)
+      };
+    }
+  }
+  fail('Mixly 4 桌面 WASM 编译超时', {
+    code: 'MIXLY4_WASM_COMPILE_TIMEOUT',
+    timeoutMs,
+    click,
+    changed,
+    runningSeen,
+    lastOutput: state && state.output
+  });
+}
+
 async function projectWorkflow(args) {
   const board = getBoard(args.board);
   const boardSelector = board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id;
@@ -2816,14 +5451,50 @@ async function projectWorkflow(args) {
   if (args.equivalenceMode && !hasReferenceSource) {
     fail('使用 equivalenceMode 时必须同时传入 sourcePath 或 sourceText');
   }
-  const build = buildProject(args);
-  const launched = await launchMixly(args);
-  const opened = await openProject({
+  const hasTree = Boolean(args.treePath || args.tree);
+  let build;
+  if (hasTree) {
+    build = await buildProject({ ...args, livePreview: false });
+  } else {
+    if (!fs.existsSync(projectPath) || !fs.statSync(projectPath).isFile()) {
+      fail('mixly_project_workflow 需要 tree/treePath，或 projectPath 必须指向已经存在的 .mix 工程');
+    }
+    if (path.extname(projectPath).toLowerCase() !== '.mix') fail('projectPath 必须使用 .mix 后缀');
+    build = {
+      projectPath,
+      skipped: true,
+      reason: 'existing-project',
+      totalNodes: parseProjectXml(fs.readFileSync(projectPath, 'utf8')).blocks.length
+    };
+  }
+  const launchedResult = await launchMixly(args);
+  const launched = {
+    alreadyRunning: launchedResult.alreadyRunning,
+    pid: launchedResult.pid || null,
+    cdpPort: launchedResult.cdpPort,
+    runtimeExecutable: launchedResult.runtimeExecutable || null,
+    runtimeExecutableSource: launchedResult.runtimeExecutableSource || null,
+    runtimeArchitecture: launchedResult.runtimeArchitecture || null,
+    automation: launchedResult.runtime && launchedResult.runtime.automation,
+    boardPage: launchedResult.boardPage ? {
+      url: launchedResult.boardPage.url,
+      workspace: launchedResult.boardPage.workspace
+    } : null
+  };
+  const libraries = await prepareWorkflowLibraries(args, board, boardSelector, projectPath);
+  const openedResult = await openProject({
     projectPath,
     board: boardSelector,
     cdpPort: getCdpPort(args),
     waitMs: args.waitMs
   });
+  const opened = {
+    projectPath: openedResult.projectPath,
+    board: openedResult.board,
+    url: openedResult.url,
+    workspace: openedResult.workspace,
+    loaded: openedResult.loaded
+  };
   const validated = await validateProject({
     projectPath,
     board: boardSelector,
@@ -2852,6 +5523,7 @@ async function projectWorkflow(args) {
       supportPaths: args.equivalenceSupportPaths,
       mode: args.equivalenceMode || 'report',
       requiredPatterns: args.equivalenceRequiredPatterns,
+      includeSupportInRequiredPatterns: args.equivalenceIncludeSupportInRequiredPatterns === true,
       ignoreStrings: args.equivalenceIgnoreStrings,
       ignoreIdentifiers: args.equivalenceIgnoreIdentifiers,
       allowExternalPath: args.allowExternalSourcePath === true
@@ -2860,6 +5532,19 @@ async function projectWorkflow(args) {
       fail('Mixly 生成代码未通过源码等价性审计', { equivalence });
     }
   }
+  let desktopCompiled = null;
+  if (isMixly4() && /C\/C\+\+/i.test(String(board.language || '')) && args.desktopCompile !== false) {
+    desktopCompiled = await compileMixly4Desktop({
+      cdpPort: getCdpPort(args),
+      waitMs: args.waitMs,
+      desktopCompileTimeoutMs: args.desktopCompileTimeoutMs
+    });
+  } else if (isMixly4()) {
+    desktopCompiled = {
+      applicable: false,
+      reason: args.desktopCompile === false ? 'explicitly-disabled' : `board-language-${board.language || 'unknown'}`
+    };
+  }
   let compiled = null;
   if (args.compile === true) {
     compiled = await compileSketch({
@@ -2867,6 +5552,7 @@ async function projectWorkflow(args) {
       fqbn: args.fqbn,
       fqbns: args.fqbns,
       arduinoCliPath: args.arduinoCliPath,
+      arduinoCliConfigPath: args.arduinoCliConfigPath,
       librariesPath: args.librariesPath,
       librariesPaths: args.librariesPaths,
       board: boardSelector,
@@ -2883,7 +5569,9 @@ async function projectWorkflow(args) {
     fqbn: board.fqbn || null,
     projectPath,
     outputPath,
-    stages: { build, launched, opened, validated, generated, equivalence, compiled }
+    generation: MIXLY_LAYOUT.generation,
+    finalCompileEngine: desktopCompiled && desktopCompiled.passed ? 'browser-wasm' : (compiled && compiled.passed ? 'arduino-cli' : null),
+    stages: { build, launched, libraries, opened, validated, generated, equivalence, desktopCompiled, compiled }
   };
 }
 
@@ -2939,7 +5627,13 @@ function stageSketchForCli(sketchPath) {
     const targetDir = path.join(stagingRoot, stem);
     fs.mkdirSync(targetDir, { recursive: true });
     fs.copyFileSync(selectedFile, path.join(targetDir, `${stem}.ino`));
-    copySketchSupport(sourceDir, targetDir, selectedFile);
+    // A generated sketch may live directly in MIXLY_HOME. In that case its
+    // siblings are application assets and live profile files, not sketch
+    // support files; copying them can be huge and can hit locked nw_cache
+    // session files while the desktop app is open.
+    if (path.resolve(sourceDir) !== path.resolve(ROOT)) {
+      copySketchSupport(sourceDir, targetDir, selectedFile);
+    }
     return { sketchPath: targetDir, cleanup: () => fs.rmSync(stagingRoot, { recursive: true, force: true }), staged: true };
   } catch (error) {
     fs.rmSync(stagingRoot, { recursive: true, force: true });
@@ -2969,24 +5663,97 @@ function findArduinoCli(explicitPath) {
   return candidates[0] || null;
 }
 
+function resolveArduinoCliConfig(explicitPath, arduinoCli) {
+  if (explicitPath) {
+    const configPath = path.resolve(explicitPath);
+    if (!fs.existsSync(configPath) || !fs.statSync(configPath).isFile()) {
+      fail(`指定的 arduino-cli 配置文件不存在: ${configPath}`);
+    }
+    return { path: configPath, source: 'explicit' };
+  }
+  if (!arduinoCli) return { path: null, source: null };
+  const cliPath = path.resolve(arduinoCli);
+  const relative = path.relative(ROOT, cliPath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    return { path: null, source: 'arduino-cli-default' };
+  }
+  const directory = path.dirname(cliPath);
+  const candidate = [
+    path.join(directory, 'arduino-cli.json'),
+    path.join(directory, 'arduino-cli.yaml'),
+    path.join(directory, 'arduino-cli.yml')
+  ].find((filePath) => fs.existsSync(filePath) && fs.statSync(filePath).isFile());
+  return candidate
+    ? { path: candidate, source: 'adjacent-to-bundled-cli' }
+    : { path: null, source: 'arduino-cli-default' };
+}
+
+function generationAwareWorkflow() {
+  if (!isMixly4()) {
+    return {
+      generation: MIXLY_LAYOUT.generation,
+      finalTool: 'mixly_project_workflow',
+      libraryModel: 'filesystem-third-party',
+      compileEngine: 'arduino-cli-or-board-runtime',
+      rules: [
+        '优先扫描并复用本地官方与 ThirdParty 积木。',
+        '缺失原语才创建传统 block/generator/index.xml 库。',
+        '新工程使用 mixly_build_project 的 tree/treePath；不要手写 .mix XML 或自行拼 next 标签。',
+        '交付前调用 mixly_project_workflow 真实打开、验证和生成代码。'
+      ]
+    };
+  }
+  const runtime = preferredMixlyRuntime();
+  return {
+    generation: 4,
+    finalTool: 'mixly_project_workflow',
+    mandatory: true,
+    libraryModel: 'plugin-manager-opfs',
+    compileEngine: 'browser-wasm',
+    compatibilityCompileEngine: 'arduino-cli',
+    desktopEquivalent: false,
+    preferredRuntime: runtime ? {
+      executable: runtime.path,
+      source: runtime.source,
+      architecture: runtime.architecture,
+      automationCapable: runtime.nwRuntime || runtime.sdk
+    } : null,
+    rules: [
+      '禁止把 Mixly 2/3 的 libraries/ThirdParty 文件夹复制流程套到 Mixly 4。',
+      '自定义库必须生成 plugin.json、index.xml、ES module index.js，并通过 PluginManager 安装到 OPFS。',
+      'WASM 编译需要的非内置 .h/.hpp/.c/.cc/.cpp 必须传给 mixly_create_library.wasmSketchFiles；只放 extraFiles/libraries 不会自动参与浏览器链接。',
+      '不要用 shell 直接修改 .mixly-mcp-staging；更新已有自制库时重新调用 mixly_create_library(overwrite=true)，让 MCP 重做语法和覆盖校验。',
+      '新工程必须使用 mixly_build_project 的 tree/treePath；禁止手写 .mix XML，结构树会自动转义 < 并正确嵌套 next。',
+      '创建库和工程后必须调用 mixly_project_workflow；它会自动发现工程引用的暂存插件、打包、导入、打开、验证、生成代码并默认点击桌面 WASM 编译。',
+      'mixly_compile 的 Arduino CLI 结果只表示生成 C++ 兼容，不是 Mixly 4 桌面编译通过。'
+    ],
+    requiredSequence: [
+      'mixly_detect_environment',
+      'mixly_scan_library(queries=[能力...], includeSpecs=true) + mixly_scan_arduino_libraries',
+      'mixly_get_block_specs（仅补查未随扫描返回的复杂动态块）',
+      'mixly_create_library（仅缺少底层原语时，按需提供 wasmSketchFiles）',
+      'mixly_project_workflow（最终闭环，不得停在创建 ZIP 或 .mix）'
+    ]
+  };
+}
+
 async function detectEnvironment(args) {
   const cdpPort = getCdpPort(args);
-  let cdp = { running: false, port: cdpPort, targets: [] };
-  try {
-    const targets = await getCdpTargets(cdpPort);
-    cdp = {
-      running: true,
-      port: cdpPort,
-      targets: targets.map(({ type, title, url }) => ({ type, title, url }))
-    };
-  } catch (_) { /* Mixly CDP is optional during discovery */ }
+  const cdp = await getCdpDiagnostics(cdpPort);
+  const http = isMixly4() ? await probeMixlyHttp(mixlyHttpOrigin()) : null;
+  const details = args.details === true;
 
   const cliCandidates = arduinoCliCandidates(args.arduinoCliPath);
   const selectedCli = cliCandidates[0] || null;
+  const cliConfig = resolveArduinoCliConfig(args.arduinoCliConfigPath, selectedCli);
   let cliProbe = null;
-  if (selectedCli && args.probeCli !== false) {
+  if (selectedCli && args.probeCli === true) {
     const version = await runCommand(selectedCli, ['version'], { timeoutMs: 15000 });
-    const cores = await runCommand(selectedCli, ['core', 'list'], { timeoutMs: 30000 });
+    const coreArgs = [
+      'core', 'list',
+      ...(cliConfig.path ? ['--config-file', cliConfig.path] : [])
+    ];
+    const cores = await runCommand(selectedCli, coreArgs, { timeoutMs: 30000 });
     cliProbe = {
       version: `${version.stdout}\n${version.stderr}`.trim(),
       versionExitCode: version.code,
@@ -3000,15 +5767,66 @@ async function detectEnvironment(args) {
     process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'Documents', 'Arduino', 'libraries') : null,
     process.env.HOME ? path.join(process.env.HOME, 'Arduino', 'libraries') : null
   ].filter((candidate) => candidate && fs.existsSync(candidate)));
+  const wasmPackages = wasmPackageSummary();
+  const boards = details
+    ? getBoardCatalog()
+    : getBoardCatalog().map((board) => ({
+      ...compactBoardForDiscovery(board),
+      profileCount: Array.isArray(board.profiles) ? board.profiles.length : 0
+    }));
+  const cdpSummary = details ? cdp : {
+    running: cdp.running,
+    available: cdp.available,
+    port: cdp.port,
+    target: cdp.target ? {
+      type: cdp.target.type,
+      title: cdp.target.title,
+      url: cdp.target.url,
+      origin: cdp.target.origin
+    } : null,
+    reason: cdp.reason
+  };
+  const wasmPackageResult = details ? wasmPackages : wasmPackages.map((item) => ({
+    kind: item.kind,
+    platform: item.platform,
+    archiveName: item.archiveName,
+    archiveBytes: item.archiveBytes,
+    libraryCount: item.libraryCount,
+    compilerFqbns: item.compilerFqbns
+  }));
 
   return {
     mixlyRoot: ROOT,
+    mixlyLayout: mixlyLayoutSummary(),
+    launch: {
+      runtime: MIXLY_LAYOUT.runtime,
+      generation: MIXLY_LAYOUT.generation,
+      httpOrigin: mixlyHttpOrigin(),
+      requiresHttpServer: MIXLY_LAYOUT.generation === 4,
+      http,
+      automation: {
+        available: cdp.available,
+        transport: cdp.available ? 'cdp' : null,
+        reason: cdp.available ? null : 'cdpUnavailable'
+      }
+    },
     mixlyExecutable: fs.existsSync(MIXLY_EXE) ? MIXLY_EXE : null,
     node: { executable: process.execPath, version: process.version, platform: process.platform, arch: process.arch },
-    boards: getBoardCatalog(),
-    cdp,
-    arduinoCli: { selected: selectedCli, candidates: cliCandidates, probe: cliProbe },
-    libraryCandidates
+    boards,
+    boardCount: boards.length,
+    cdp: cdpSummary,
+    arduinoCli: {
+      selected: selectedCli,
+      configFile: cliConfig.path,
+      configSource: cliConfig.source,
+      candidates: details ? cliCandidates : undefined,
+      probe: cliProbe
+    },
+    compileEngines: compileEngineSummary(wasmPackages, selectedCli),
+    generationAwareWorkflow: generationAwareWorkflow(),
+    libraryCandidates: details ? libraryCandidates : undefined,
+    wasmPackages: wasmPackageResult,
+    detailsIncluded: details
   };
 }
 
@@ -3050,7 +5868,53 @@ function compileResourceRisk(metrics) {
   return { level, warnings };
 }
 
-function resolveCompileLibraryPaths(args, allowExternal) {
+function compileLibraryLogicalPath(board, resource, sourceRoot, source) {
+  const name = String(resource.name || '').trim();
+  if (source === 'filesystem') {
+    return path.join(board.root, 'libraries', 'ThirdParty', name, 'libraries');
+  }
+  if (source === 'mixly4-staging') return path.join(sourceRoot, 'libraries');
+  const root = String(resource.opfsRoot || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  const version = String(resource.version || resource.metadata?.currentVersion || resource.metadata?.version || '').trim();
+  return [root, name, version, 'libraries'].filter(Boolean).join('/');
+}
+
+function compileLibraryCandidates(board, resource, context) {
+  const candidates = [];
+  const append = (sourceRoot, source, temporary) => {
+    if (!sourceRoot || !fs.existsSync(sourceRoot) || !fs.statSync(sourceRoot).isDirectory()) return;
+    const librariesPath = path.join(sourceRoot, 'libraries');
+    if (!fs.existsSync(librariesPath) || !fs.statSync(librariesPath).isDirectory()) return;
+    candidates.push({
+      name: resource.name,
+      source,
+      path: librariesPath,
+      logicalPath: compileLibraryLogicalPath(board, resource, sourceRoot, source),
+      temporary,
+      pluginPath: sourceRoot
+    });
+  };
+
+  // Staging is deterministic and is preferred when a library was just created
+  // by the MCP. Fall back to the materialized OPFS copy for installed plugins.
+  if (resource.stagingPath) append(resource.stagingPath, 'mixly4-staging', false);
+  if (resource.path && resource.path !== resource.stagingPath) {
+    const source = resource.source === 'mixly4-opfs' ? 'mixly4-opfs' : resource.source;
+    append(resource.path, source, source === 'mixly4-opfs');
+  }
+  for (const candidate of candidates) {
+    if (candidate.source === 'mixly4-opfs') {
+      candidate.opfsRoot = context.storage.root || null;
+      candidate.logicalPath = compileLibraryLogicalPath(board, {
+        ...resource,
+        opfsRoot: candidate.opfsRoot
+      }, candidate.pluginPath, candidate.source);
+    }
+  }
+  return candidates;
+}
+
+async function resolveCompileLibraryPaths(args, allowExternal) {
   const explicitInputs = [
     ...(args.librariesPath ? [{ value: args.librariesPath, field: 'librariesPath' }] : []),
     ...(Array.isArray(args.librariesPaths)
@@ -3078,34 +5942,58 @@ function resolveCompileLibraryPaths(args, allowExternal) {
     fail('使用 mixlyLibraries 时必须同时传入 board');
   }
   const resolvedMixlyLibraries = [];
-  let mixlyBoard = null;
+  const selectedBoard = args.board ? getBoard(args.board) : null;
+  let mixlyBoard = selectedBoard
+    ? (selectedBoard.selectedProfile ? `${selectedBoard.id}@${selectedBoard.selectedProfile}` : selectedBoard.id)
+    : null;
+  let mixlyContext = null;
   if (requestedMixlyLibraries.length) {
-    const board = getBoard(args.board);
-    mixlyBoard = board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id;
-    const thirdPartyRoot = path.join(board.root, 'libraries', 'ThirdParty');
-    const availableLibraries = fs.existsSync(thirdPartyRoot)
-      ? fs.readdirSync(thirdPartyRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-      : [];
+    const board = selectedBoard;
+    mixlyContext = await thirdPartyLibraryContext(board, args, {
+      mode: isMixly4() ? 'libraries' : 'analysis',
+      libraryNames: requestedMixlyLibraries
+    });
+    const availableLibraries = mixlyContext.resources.map((resource) => resource.name).sort();
     for (const requestedName of requestedMixlyLibraries) {
       if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(requestedName)) {
-        fail(`Mixly 库名称格式不正确: ${requestedName}`);
+        mixlyContext.cleanup();
+        fail(`Mixly library name is invalid: ${requestedName}`);
       }
-      const name = availableLibraries.find((candidate) =>
-        candidate.toLowerCase() === requestedName.toLowerCase()
+      const resource = mixlyContext.resources.find((candidate) =>
+        candidate.name.toLowerCase() === requestedName.toLowerCase()
       );
-      if (!name) {
-        fail(`当前板卡未安装 Mixly ThirdParty 库: ${requestedName}`, {
+      if (!resource) {
+        const details = {
           board: board.id,
-          availableMixlyLibraries: availableLibraries.sort()
-        });
+          availableMixlyLibraries: availableLibraries,
+          pluginStorage: mixlyContext.storage
+        };
+        mixlyContext.cleanup();
+        if (isMixly4() && !mixlyContext.storage.available) {
+          details.code = 'MIXLY4_OPFS_UNAVAILABLE';
+          fail(`Unable to read Mixly 4 plugin library: ${requestedName}`, details);
+        }
+        fail(`Mixly ThirdParty library is not installed: ${requestedName}`, details);
       }
-      const libraryPath = path.join(thirdPartyRoot, name, 'libraries');
-      if (!fs.existsSync(libraryPath) || !fs.statSync(libraryPath).isDirectory()) {
-        fail(`Mixly ThirdParty 库没有 Arduino libraries 目录: ${libraryPath}`);
+      const candidates = compileLibraryCandidates(board, resource, mixlyContext);
+      const selected = candidates[0];
+      if (!selected) {
+        const details = {
+          board: board.id,
+          library: resource.name,
+          pluginStorage: mixlyContext.storage,
+          pluginPath: resource.path,
+          stagingPath: resource.stagingPath || null,
+          candidates: candidates.map((candidate) => candidate.path)
+        };
+        mixlyContext.cleanup();
+        fail(`Mixly library has no Arduino libraries directory: ${resource.name}`, details);
       }
-      resolvedMixlyLibraries.push({ name, path: libraryPath });
+      // Keep the Mixly 2/3 response contract byte-for-byte compatible while
+      // exposing source/temporary paths for the new Mixly 4 resolver.
+      resolvedMixlyLibraries.push(!isMixly4() && selected.source === 'filesystem'
+        ? { name: selected.name, path: selected.path }
+        : selected);
     }
   }
 
@@ -3128,11 +6016,98 @@ function resolveCompileLibraryPaths(args, allowExternal) {
     pathKeys.add(key);
     return true;
   });
+  const cleanupState = {
+    required: Boolean(mixlyContext),
+    completed: false,
+    temporaryPaths: mixlyContext?.storage?.materializedRoot ? [mixlyContext.storage.materializedRoot] : [],
+    removed: []
+  };
+  const cleanup = () => {
+    if (!mixlyContext) {
+      cleanupState.completed = true;
+      return;
+    }
+    const temporaryPaths = cleanupState.temporaryPaths.slice();
+    mixlyContext.cleanup();
+    cleanupState.removed = temporaryPaths.filter((candidate) => !fs.existsSync(candidate));
+    cleanupState.completed = true;
+  };
   return {
     librariesPath: librariesPaths[0] || null,
     librariesPaths,
     mixlyBoard,
-    mixlyLibraryPaths: resolvedMixlyLibraries
+    mixlyLibraryPaths: resolvedMixlyLibraries,
+    selectedBoard,
+    mixlyLibraryStorage: mixlyContext ? mixlyContext.storage : null,
+    cleanupState,
+    cleanup
+  };
+}
+
+function tryFqbnBase(value) {
+  const normalized = String(value || '').trim();
+  const parts = normalized.split(':');
+  if (parts.length < 3 || parts.slice(0, 3).some((part) => !part.trim())) return null;
+  return parts.slice(0, 3).join(':').toLowerCase();
+}
+
+function fqbnBase(value) {
+  const base = tryFqbnBase(value);
+  if (!base) fail(`FQBN 格式不正确: ${value}`);
+  return base;
+}
+
+function compileFqbnList(args) {
+  const hasSingle = args.fqbn != null;
+  const hasMultiple = Array.isArray(args.fqbns) && args.fqbns.length > 0;
+  if (hasSingle && hasMultiple) fail('fqbn 与 fqbns 只能选择一个，不能同时传入');
+  const values = hasMultiple ? args.fqbns : (hasSingle ? [args.fqbn] : []);
+  const normalized = [];
+  const seen = new Set();
+  for (let index = 0; index < values.length; index++) {
+    const value = String(values[index]).trim();
+    if (!value) fail(`${hasMultiple ? `fqbns[${index}]` : 'fqbn'} 不能为空`);
+    fqbnBase(value);
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(value);
+  }
+  if (!normalized.length) fail('编译前必须由 AI 根据用户板卡传入 fqbn 或 fqbns');
+  return normalized;
+}
+
+function validateCompileBoardFqbns(board, fqbns) {
+  if (!board) return { checked: false, board: null, candidates: [], matches: [] };
+  const profiles = board.selectedProfile
+    ? [{ name: board.selectedProfile, fqbn: board.fqbn }]
+    : (board.profiles || []);
+  const candidates = profiles
+    .filter((profile) => profile && profile.fqbn)
+    .map((profile) => ({ name: profile.name, fqbn: profile.fqbn, base: tryFqbnBase(profile.fqbn) }))
+    .filter((profile) => profile.base);
+  if (!candidates.length) {
+    return { checked: false, board: board.id, candidates: [], matches: [] };
+  }
+  const matches = fqbns.map((fqbn) => ({
+    fqbn,
+    profiles: candidates
+      .filter((candidate) => candidate.base === fqbnBase(fqbn))
+      .map(({ name, fqbn: profileFqbn }) => ({ name, fqbn: profileFqbn }))
+  }));
+  const mismatches = matches.filter((item) => item.profiles.length === 0).map((item) => item.fqbn);
+  if (mismatches.length) {
+    fail('编译 FQBN 与所选 Mixly 板卡不匹配', {
+      board: board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id,
+      mismatches,
+      availableFqbns: unique(candidates.map((candidate) => candidate.fqbn))
+    });
+  }
+  return {
+    checked: true,
+    board: board.selectedProfile ? `${board.id}@${board.selectedProfile}` : board.id,
+    candidates: unique(candidates.map((candidate) => candidate.fqbn)),
+    matches
   };
 }
 
@@ -3140,24 +6115,28 @@ async function compileSketch(args) {
   const allowExternal = args.allowExternalPath === true;
   const sketchPath = resolveInputPath(args.sketchPath, allowExternal);
   if (!fs.existsSync(sketchPath)) fail(`Arduino 工程不存在: ${sketchPath}`);
-  const libraryResolution = resolveCompileLibraryPaths(args, allowExternal);
-  const arduinoCli = findArduinoCli(args.arduinoCliPath);
-  if (!arduinoCli) {
-    fail('找不到 arduino-cli；请先调用 mixly_detect_environment，或显式传 arduinoCliPath');
-  }
-  const fqbnList = Array.isArray(args.fqbns) && args.fqbns.length
-    ? unique(args.fqbns)
-    : (args.fqbn ? [args.fqbn] : []);
-  if (!fqbnList.length) fail('编译前必须由 AI 根据用户板卡传入 fqbn 或 fqbns');
-  const results = [];
-  const timeoutMs = Number(args.timeoutMs || DEFAULT_COMPILE_TIMEOUT_MS);
-  const staged = stageSketchForCli(sketchPath);
+  const libraryResolution = await resolveCompileLibraryPaths(args, allowExternal);
+  let staged = null;
   try {
+    const arduinoCli = findArduinoCli(args.arduinoCliPath);
+    if (!arduinoCli) {
+      fail('找不到 arduino-cli；请先调用 mixly_detect_environment，或显式传 arduinoCliPath');
+    }
+    const arduinoCliConfig = resolveArduinoCliConfig(args.arduinoCliConfigPath, arduinoCli);
+    const fqbnList = compileFqbnList(args);
+    const boardFqbnValidation = validateCompileBoardFqbns(libraryResolution.selectedBoard, fqbnList);
+    const results = [];
+    const timeoutMs = Number(args.timeoutMs || DEFAULT_COMPILE_TIMEOUT_MS);
+    staged = stageSketchForCli(sketchPath);
     for (const fqbn of fqbnList) {
       const buildPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mixly-mcp-build-'));
       let result;
       try {
-        const compileArgs = ['compile', '--fqbn', fqbn];
+        const compileArgs = [
+          'compile',
+          ...(arduinoCliConfig.path ? ['--config-file', arduinoCliConfig.path] : []),
+          '--fqbn', fqbn
+        ];
         for (const librariesPath of libraryResolution.librariesPaths) {
           compileArgs.push('--libraries', librariesPath);
         }
@@ -3178,29 +6157,38 @@ async function compileSketch(args) {
         buildPath: args.keepBuild === true ? buildPath : null
       });
     }
+    const riskRank = { unknown: 0, normal: 1, warning: 2, high: 3 };
+    const highestRisk = results.reduce((current, item) =>
+      riskRank[item.resourceRisk.level] > riskRank[current] ? item.resourceRisk.level : current, 'unknown');
+    return {
+      engine: 'arduino-cli',
+      validationScope: isMixly4() ? 'generated-cpp-compatibility' : 'arduino-compile',
+      desktopEquivalent: isMixly4() ? false : null,
+      sketchPath,
+      cliSketchPath: staged.sketchPath,
+      staged: staged.staged,
+      arduinoCli,
+      arduinoCliConfigPath: arduinoCliConfig.path,
+      arduinoCliConfigSource: arduinoCliConfig.source,
+      boardFqbnValidation,
+      librariesPath: libraryResolution.librariesPath,
+      librariesPaths: libraryResolution.librariesPaths,
+      mixlyBoard: libraryResolution.mixlyBoard,
+      mixlyLibraryPaths: libraryResolution.mixlyLibraryPaths,
+      mixlyLibraryStorage: libraryResolution.mixlyLibraryStorage,
+      cleanup: libraryResolution.cleanupState,
+      timeoutMs,
+      results,
+      resourceRisk: {
+        level: highestRisk,
+        warnings: results.flatMap((item) => item.resourceRisk.warnings.map((message) => ({ fqbn: item.fqbn, message })))
+      },
+      passed: results.every((item) => item.code === 0 && !item.timedOut)
+    };
   } finally {
-    if (staged.cleanup) staged.cleanup();
+    if (staged && staged.cleanup) staged.cleanup();
+    libraryResolution.cleanup();
   }
-  const riskRank = { unknown: 0, normal: 1, warning: 2, high: 3 };
-  const highestRisk = results.reduce((current, item) =>
-    riskRank[item.resourceRisk.level] > riskRank[current] ? item.resourceRisk.level : current, 'unknown');
-  return {
-    sketchPath,
-    cliSketchPath: staged.sketchPath,
-    staged: staged.staged,
-    arduinoCli,
-    librariesPath: libraryResolution.librariesPath,
-    librariesPaths: libraryResolution.librariesPaths,
-    mixlyBoard: libraryResolution.mixlyBoard,
-    mixlyLibraryPaths: libraryResolution.mixlyLibraryPaths,
-    timeoutMs,
-    results,
-    resourceRisk: {
-      level: highestRisk,
-      warnings: results.flatMap((item) => item.resourceRisk.warnings.map((message) => ({ fqbn: item.fqbn, message })))
-    },
-    passed: results.every((item) => item.code === 0 && !item.timedOut)
-  };
 }
 
 function validateArguments(toolName, args) {
@@ -3218,9 +6206,11 @@ function validateArguments(toolName, args) {
     if (!property || value == null) continue;
     if (property.type === 'string' && typeof value !== 'string') fail(`参数 ${name} 必须是字符串`);
     if (property.type === 'boolean' && typeof value !== 'boolean') fail(`参数 ${name} 必须是布尔值`);
-    if ((property.type === 'number' || property.type === 'integer') && typeof value !== 'number') {
+    if ((property.type === 'number' || property.type === 'integer') &&
+      (typeof value !== 'number' || !Number.isFinite(value))) {
       fail(`参数 ${name} 必须是数字`);
     }
+    if (property.type === 'integer' && !Number.isInteger(value)) fail(`参数 ${name} 必须是整数`);
     if (property.type === 'array' && !Array.isArray(value)) fail(`参数 ${name} 必须是数组`);
     if (property.type === 'object' && (typeof value !== 'object' || Array.isArray(value))) fail(`参数 ${name} 必须是对象`);
     if (property.type === 'array' && Array.isArray(value)) {
@@ -3247,6 +6237,7 @@ async function callTool(name, rawArgs = {}) {
   const args = validateArguments(name, rawArgs);
   switch (name) {
     case 'mixly_scan_library': return scanLibrary(args);
+    case 'mixly_scan_arduino_libraries': return scanArduinoLibraries(args);
     case 'mixly_get_block_specs': return getBlockSpecs(args);
     case 'mixly_inspect_library': return inspectLibrary(args);
     case 'mixly_detect_environment': return detectEnvironment(args);
@@ -3272,6 +6263,56 @@ function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+function mcpServerInstructions() {
+  const generationNotice = isMixly4()
+    ? 'Mixly 4 强制规则：使用 PluginManager/OPFS；非内置 C/C++ 必须放入 wasmSketchFiles；最终调用 mixly_project_workflow 自动启动软件、导入插件并点击桌面 WASM 编译。mixly_compile 仅是 CLI 兼容检查。'
+    : 'Mixly 2/3 使用本地官方积木与传统 ThirdParty 库，最终调用 mixly_project_workflow。';
+  return `${generationNotice} 快速流程：先 mixly_detect_environment（默认勿探测 CLI），分析源码后优先一次调用 mixly_scan_library(queries=[能力关键词...],includeSpecs=true)；只有复杂动态块再调用 mixly_get_block_specs，勿用 shell 搜官方生成器。不要索取 full 或示例，除非确有需要。优先拼官方/已安装积木，缺失底层原语才建小库；更新自制库应重新调用 mixly_create_library(overwrite=true)，不要直接修改 staging。新工程只能用 mixly_build_project 的 tree/treePath，禁止手写 .mix XML；它会自动转义文本并嵌套 next。Mixly 4 中每完成一组可运行结构树可立即刷新 Blockly，但不要为了动画逐块重发完整工程。变量、函数、判断、循环和硬件操作保持可见；不得为回避变量/XML而把业务状态机藏进自定义库，没有 ELSE 子树不得添加“否则”。有参考源码时做等价审计。最终交付不得停在 ZIP 或 .mix。`;
+}
+
+function toolResultText(toolName, value) {
+  const summary = { tool: toolName, ok: true };
+  if (value && typeof value === 'object') {
+    for (const key of [
+      'passed', 'status', 'board', 'boardCount', 'generation', 'finalCompileEngine',
+      'projectPath', 'outputPath', 'libraryName', 'zipPath', 'resultMode', 'query',
+      'requested', 'found', 'matchedCount', 'truncated', 'cache'
+    ]) {
+      if (value[key] !== undefined) summary[key] = value[key];
+    }
+    if (toolName === 'mixly_detect_environment') {
+      summary.mixlyRoot = value.mixlyRoot;
+      summary.layout = value.mixlyLayout;
+      summary.boards = Array.isArray(value.boards) ? value.boards.map((board) => board.id) : [];
+      summary.cdpAvailable = Boolean(value.cdp && value.cdp.available);
+      summary.finalTool = value.generationAwareWorkflow && value.generationAwareWorkflow.finalTool;
+      summary.compileEngine = value.generationAwareWorkflow && value.generationAwareWorkflow.compileEngine;
+    } else if (toolName === 'mixly_scan_library') {
+      summary.board = value.board && value.board.id || value.board;
+      summary.totals = value.totals || value.official;
+      summary.candidates = value.availableBlockTypes || [];
+      summary.next = value.resultMode === 'summary'
+        ? '再次调用 mixly_scan_library 并传 queries + includeSpecs=true'
+        : Array.isArray(value.specs) ? '使用已返回的真实契约构建 tree/treePath' : '对选中的 type 调用 mixly_get_block_specs';
+    } else if (toolName === 'mixly_get_block_specs') {
+      summary.types = Array.isArray(value.specs) ? value.specs.map((spec) => ({ type: spec.type, owner: spec.owner })) : [];
+      summary.unknownTypes = value.unknownTypes || [];
+      summary.examplesIncluded = value.examplesIncluded;
+    } else if (toolName === 'mixly_build_project') {
+      summary.totalNodes = value.totalNodes;
+      summary.livePreview = value.livePreview;
+    } else if (toolName === 'mixly_project_workflow' && value.stages) {
+      summary.importedLibraries = value.stages.libraries && Array.isArray(value.stages.libraries.imported)
+        ? value.stages.libraries.imported.map((item) => item.name)
+        : [];
+      summary.desktopCompiled = Boolean(value.stages.desktopCompiled && value.stages.desktopCompiled.passed);
+      summary.metrics = value.stages.desktopCompiled && value.stages.desktopCompiled.metrics || null;
+    }
+  }
+  summary.detail = '完整结果见 structuredContent';
+  return JSON.stringify(summary);
+}
+
 function handleMessage(message) {
   if (!message || message.jsonrpc !== '2.0') {
     send({ jsonrpc: '2.0', id: message && message.id != null ? message.id : null, error: { code: -32600, message: 'Invalid Request' } });
@@ -3287,8 +6328,8 @@ function handleMessage(message) {
       result: {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'mixly-local-builder', version: '2.3.0' },
-        instructions: '所有规则以提示和帮助复用为主，不因风格选择阻止 AI。建议先用 mixly_detect_environment 探测环境，并用 mixly_get_board_profiles 从本机元数据选择真实型号、FQBN 和配置项；不要固定任一板卡。分析源码后，再用 mixly_scan_library 动态扫描目标板当前安装的全部积木；availableBlockTypes 同时包含板卡官方目录和 libraries/ThirdParty，第三方积木也是可优先复用的本地积木。遇到不熟悉的 type，可调用 mixly_get_block_specs 读取本机真实 defaultXml、字段、输入、shadow 和生成器接口，不要凭名称猜结构；新安装或后续增加的积木会自动进入扫描结果，无需修改 MCP。mixly_inspect_library 可查看第三方库目录、语言、媒体、图片字段和 Arduino libraries。变量、函数、判断、循环、数学、时间及硬件操作尽量保持为可见积木；粒度过大只返回 warning。中文名称按用户偏好处理：只修改 variables_* 的 VAR、procedure 的 NAME、mutation name/arg name，声明与引用保持一致，官方 type 和输入名不要翻译。图片使用与用户要求不一致时只提示。大型工程建议通过 treePath 调用 mixly_build_project；构建器会连接变量栈、安排布局、推导 controls_if mutation，并在写入前检查本机可可靠解析的官方与 ThirdParty 块输入契约。最后必须真实打开、验证和生成代码；有参考源码时用 mixly_verify_equivalence 检查明显行为遗漏，要求严格交付时使用 behavioral-strict 或 exact。Arduino 编译可隔离传入多个库目录，结果中的 Flash/SRAM 风险不能因编译成功而忽略。只有无效 XML、未安装 block type、定义/生成器缺失、真实 Blockly 节点丢失、严格等价审计失败或编译失败等确定不可用问题才报错，命名、粒度、变量断链、孤立块和重叠都作为 warnings 返回。'
+        serverInfo: { name: 'mixly-local-builder', version: MCP_SERVER_VERSION },
+        instructions: mcpServerInstructions()
       }
     });
     return;
@@ -3302,7 +6343,7 @@ function handleMessage(message) {
     return;
   }
   if (message.method === 'tools/list') {
-    send({ jsonrpc: '2.0', id: message.id, result: { tools: toolDefinitions } });
+    send({ jsonrpc: '2.0', id: message.id, result: { tools: listedToolDefinitions() } });
     return;
   }
   if (message.method === 'tools/call') {
@@ -3311,19 +6352,22 @@ function handleMessage(message) {
         jsonrpc: '2.0', id: message.id,
         result: {
           structuredContent: value,
-          content: [{ type: 'text', text: JSON.stringify(value, null, 2) }]
+          content: [{ type: 'text', text: toolResultText(message.params && message.params.name, value) }]
         }
       }))
-      .catch((error) => send({
-        jsonrpc: '2.0', id: message.id,
-        result: {
-          isError: true,
-          content: [{
-            type: 'text',
-            text: JSON.stringify({ message: error.message, details: error.details || null }, null, 2)
-          }]
-        }
-      }));
+      .catch((error) => {
+        process.stderr.write(`[mixly-local-mcp] ${error.stack || error.message || String(error)}\n`);
+        send({
+          jsonrpc: '2.0', id: message.id,
+          result: {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ message: error.message, details: error.details || null }, null, 2)
+            }]
+          }
+        });
+      });
     return;
   }
   if (message.id != null) {
@@ -3347,5 +6391,16 @@ function startServer() {
 if (require.main === module) startServer();
 
 module.exports = {
-  projectLoadDiagnostics
+  projectLoadDiagnostics,
+  detectMixlyLayout,
+  mixlyHttpOrigin,
+  buildEditorUrl,
+  projectUrl,
+  selectCdpTarget,
+  summarizeCdpTargets,
+  getCdpPort,
+  getCdpDiagnostics,
+  generationAwareWorkflow,
+  mcpServerInstructions,
+  preferredMixlyRuntime
 };

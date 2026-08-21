@@ -1,5 +1,118 @@
 # 更新日志
 
+## 2.5.4 - 2026-08-21
+
+- `mixly_scan_library` 支持最多 8 个 `queries` 分组检索，并可用 `includeSpecs=true` 在一次调用中附带最多 20 个候选的精简真实契约。
+- Harness 指令优先使用多能力扫描，不再通过 shell 逐个搜索官方生成器；更新自制库需重新走 MCP 校验。
+- 新工程强制推荐 `mixly_build_project.tree/treePath`，禁止手写 `.mix`；结构树自动完成文本转义、`next` 嵌套和连接契约验证。
+- `parseProjectXml` 提前拒绝游离、重复或非法子节点的 `<next>`，避免合法 XML 被 Blockly 静默截断后才在真实加载阶段发现节点丢失。
+- 新增多能力扫描、内联契约和错误 `next` 回归；Mixly 4 ESP32 的真实 122 节点复杂工程通过静态与 live Blockly 一致性验证。
+
+## 2.5.3 - 2026-08-21
+
+- Mixly 4 实时预览改为直接更新当前 Blockly 工作区，同一板卡不再导航或重载页面，Harness 侧栏和会话保持打开。
+- 打开工程和导入 Mixly 4 插件统一复用板卡页面判断；只有板卡实际变化时才导航。
+- AI 侧栏状态写入同源会话存储，必要的刷新或板卡切换后自动恢复；用户手动关闭后保持关闭。
+- 工程加载后将首个顶层积木居中到侧栏左侧可见区域，避免已渲染积木被 AI 面板遮挡。
+- 新增真实 Mixly 4 回归：MCP 写入前后 target、URL、侧栏均不变，并检查积木 SVG 位于可视区域。
+
+## 2.5.2 - 2026-08-21
+
+- Mixly 4 AI 入口改为全局 `boards/index.html` 适配器，修复按钮只在导入 Harness 插件的 Arduino Uno 页面出现的问题。
+- 保留 OPFS 插件兼容路径，并验证重复加载不会产生第二个 AI 按钮。
+- Harness 精简模式公开 `mixly_build_project`；在锁定 CDP 的 Mixly 4 中，结构树写入后默认立即载入当前 Blockly，最终工作流仍负责完整验证与编译。
+
+## 2.5.1 - 2026-08-21
+
+- 修复共享 `active-context.json` 被其他 Mixly 窗口覆盖后，同一 Harness 聊天会从 Mixly 4 静默切到 Mixly 2 的问题。
+- MCP 路由器在启动时固定 Mixly 根目录、代际、CDP 和 origin；代际切换由启动器结束旧进程树后重新启动。
+- Harness 工作目录绑定当前 Mixly 根目录；保留共享 `DSH_HOME` 中已有的 API 配置和聊天数据，MCP 上下文不再随文件变化。
+- AI 侧栏标题显示当前 Mixly 代际，适配器忽略脚本伪造的按钮点击。
+- 修复 MCP 忽略 Harness 注入的 Mixly 4 CDP 端口；无参数工具调用现在使用实际窗口端口，不再错误回退到 `9333`。
+
+## 2.5.0 - 2026-08-21
+
+### Mixly 内置 AI 客户端
+
+- 新增官方 DeepSeek Harness 集成。Mixly 2/3 通过薄适配脚本增加顶栏按钮，Mixly 4 通过不贡献任何工具箱积木的 OPFS 插件增加按钮。
+- Harness 使用便携 Node.js 24 和官方 `@deepseek-ai/dsh`，统一安装在 `%LOCALAPPDATA%\MixlyHarness`；三个 Mixly 代际共用一个 Web 客户端和配置目录。
+- 新增动态 MCP stdio 路由器。点击任意 Mixly 窗口会更新活动根目录，下一次工具调用自动切换对应 MCP 子进程，无需重启 Harness。
+- Harness 侧只公开 8 个高频工作流工具的 schema，19 个工具仍可按名称调用，减少工具描述占用和模型选错概率。
+- Mixly 4 客户端改为主窗口内持久 iframe 侧栏，带刷新和关闭按钮；不再使用会被 NW.js 回收的远程子窗口。
+- 启动器可按当前页面 origin 自动发现 Mixly 4 CDP 端口，避免把实际 `9347` 错当成默认 `9333`。
+- 纯 Web Mixly 3 页面会安全禁用 AI 按钮；只有真实 Node 桥接存在时才允许启动，不与 `.mixly-nav` 委托事件冲突。
+
+### 验证
+
+- Mixly 2 和 Mixly 4 均通过可见桌面窗口真实鼠标点击；共享 Harness 冷启动约 4.5 秒，代际上下文复用切换约 0.44 秒。
+- Mixly 4 侧栏持续加载 10 秒以上，iframe 返回 HTTP 200，工具箱没有新增 Harness 分类或积木。
+- 路由器在同一 MCP 客户端连接中完成 Mixly 2 到 Mixly 4 切换，并分别返回正确代际探测结果。
+
+## 2.4.3 - 2026-08-16
+
+### 性能与上下文
+
+- `mixly_scan_library` 默认返回计数摘要；普通候选检索使用 `query` 和最多 60 个结果，只有审计全集时才传 `full=true`。
+- 积木扫描和规格读取增加 30 秒常驻进程缓存；`refresh=true` 可强制更新，建库和导库成功后会自动失效，避免读取旧插件。
+- `mixly_get_block_specs` 默认不遍历本地 `.mix` 示例，需要示例时显式传 `includeExamples=true`。
+- `mixly_detect_environment` 默认不执行 Arduino CLI 子进程，也不返回板卡 profiles/CDP targets 等诊断细节；分别通过 `probeCli=true`、`details=true` 按需展开。
+- MCP 工具调用的 `content` 改为短摘要，完整结果只保留在 `structuredContent`，避免同一大对象重复消耗上下文；初始化说明同步压缩。
+- Mixly 4 隐藏编译菜单改为等待可见状态；发送真实鼠标事件后必须观察到输出变化，未触发时使用可见按钮的原生点击兜底并如实记录方法。
+
+### 验证
+
+- 本机 AVR/RGB 首次扫描约 960 ms，30 秒缓存命中约 6.7 ms；关键词结构化结果约 2.2 KB，完整全集约 42.7 KB，文本摘要约 0.7 KB。
+
+## 2.4.2 - 2026-08-16
+
+### Mixly 4 工作流
+
+- MCP 初始化指令与环境探测新增代际感知规则，明确区分 Mixly 4 的 OPFS 插件、`wasmSketchFiles` 和浏览器 WASM 编译，与 Mixly 2/3 的文件系统 ThirdParty 流程。
+- `mixly_project_workflow` 自动识别工程引用的暂存插件，完成打包、`PluginManager` 导入、打开、验证、代码生成，并对 C/C++ 默认点击桌面按钮等待真实 WASM 结果。
+- 工作流支持直接复用已有 `.mix`；`libraryNames`、`libraryZipPaths`、`autoImportLibraries`、`desktopCompile` 可控制高级行为。
+- `mixly_launch` 优先选择本地 64 位 NW.js/SDK，自动从 MixVM 首页进入目标板卡页；HTTP 存在但 CDP 不可用时返回明确错误，不再继续执行伪自动化流程。
+- 桌面编译可展开“更多”菜单并点击其中的编译命令；工作流返回内容移除冗长 OPFS manifest。
+
+### 验证
+
+- 从 HTTP/CDP 均未启动的状态只调用一次 `mixly_project_workflow`：MCP 自行启动 x64 Mixly 4、导入 MAX30102 插件、加载 19 个节点、注入 6 个 WASM 源文件并输出 `==编译成功==`。
+
+## 2.4.1 - 2026-08-14
+
+### 新增
+
+- `mixly_create_library` 支持 `wasmSketchFiles`，将 `.h/.hpp/.c/.cc/.cpp` 作为精确命名的浏览器 WASM `sketchFiles` 注入 Mixly 4 生成器。
+- 新增可见 Mixly 4 桌面窗口的编译按钮点击与进程存活回归测试，并加入 13 块的 MAX30102 心率插件示例。
+
+### 修复与优化
+
+- 生成代码时临时隔离 WASM 源文件键，避免 Mixly 4 把 `MAX30105.h` 等键再次拼成 `.h.h`，同时在编译阶段保留完整源文件。
+- Mixly 4 OPFS 导入为嵌套文件递归创建父目录；大型 CDP 表达式通过临时文件传递，避免 Windows 命令行过长。
+- MAX30102 WASM 库使用单翻译单元兼容入口，解决独立 `.cpp` 在 AVR 浏览器编译器中未参与链接的问题。
+
+### 验证
+
+- 在可见的 64 位 Mixly 4 窗口中实际点击编译，Arduino AVR UNO 完成 MAX30102 工程的 WASM 编译和链接，输出 `==编译成功==`，宿主未退出。
+
+## 2.4.0 - 2026-08-10
+
+### 新增
+
+- 兼容 Mixly 4 NW.js/HTTP 运行时，自动识别根部 `boards` 与 `static-server/server.js`，默认服务地址为 `http://localhost:65234`。
+- `mixly_scan_arduino_libraries` 支持从 Mixly 4 WASM 归档的 `libraries.manifest.json` 返回库名、版本、头文件、依赖和文件清单。
+- Mixly 4 已安装插件可通过 OPFS `PluginManager.fs` 读取 `installed.json`、`index.xml` 和 `index.js`，纳入积木扫描与规格检查。
+- `mixly_create_library` 在 Mixly 4 下生成 `plugin.json`、`index.xml` 和 ES module `index.js`，并在暂存目录中等待打包/导入。
+
+### 修复与优化
+
+- Mixly 4 导入改用 `PluginManager.installPlugin`，不再把插件解压到只读板卡目录，避免 `EISDIR`。
+- Mixly 4 插件 ZIP 使用根部入口文件和平铺文件条目；Mixly 2/3 的传统 `block/`、`generator/` 结构保持兼容。
+- 发布脚本和便携包测试从 `package.json` 读取版本，README 使用仓库内版本，减少发布包与源码文档漂移。
+
+### 验证
+
+- Mixly 4 HTTP/CDP 探测、WASM 库清单读取和插件运行时回归测试加入发布验证。
+
 ## 2.3.0 - 2026-08-07
 
 ### 新增

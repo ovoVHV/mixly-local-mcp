@@ -18,6 +18,7 @@ const invalidIfProject = path.join(root, 'McpControlsIfConnectionTest.mix');
 const invalidOfficialProject = path.join(root, 'McpOfficialConnectionTest.mix');
 const invalidProject = path.join(root, 'McpInvalidConnectionTest.mix');
 const validProject = path.join(root, 'McpValidConnectionTest.mix');
+const malformedNextProject = path.join(root, 'McpMalformedNextTest.mix');
 
 const child = spawn(process.execPath, [path.join(__dirname, 'mixly_mcp_server.js')], {
   cwd: root,
@@ -59,7 +60,7 @@ async function call(name, args) {
 
 function cleanup() {
   fs.rmSync(libraryPath, { recursive: true, force: true });
-  for (const filePath of [mutationProject, invalidIfProject, invalidOfficialProject, invalidProject, validProject]) {
+  for (const filePath of [mutationProject, invalidIfProject, invalidOfficialProject, invalidProject, validProject, malformedNextProject]) {
     fs.rmSync(filePath, { force: true });
   }
 }
@@ -103,6 +104,20 @@ async function main() {
     protocolVersion: '2024-11-05', capabilities: {},
     clientInfo: { name: 'mixly-tree-validation-test', version: '1.0.0' }
   });
+
+  const malformedNext = await call('mixly_save_project', {
+    board: 'default/arduino_avr',
+    projectPath: malformedNextProject,
+    overwrite: true,
+    requireChineseNames: false,
+    projectXml: '<xml xmlns="http://www.w3.org/1999/xhtml"><block type="controls_delay" id="first"></block><next><block type="controls_delay" id="lost"></block></next></xml>'
+  });
+  assert.equal(malformedNext.result.isError, true);
+  const malformedNextFailure = JSON.parse(malformedNext.result.content[0].text);
+  assert.equal(malformedNextFailure.details.code, 'MIXLY_XML_STRUCTURE_INVALID');
+  assert(malformedNextFailure.details.structureErrors.some((item) => item.code === 'CONNECTION_OUTSIDE_BLOCK'));
+  assert.match(malformedNextFailure.details.hint, /tree|结构树/);
+  assert.equal(fs.existsSync(malformedNextProject), false);
 
   const mutationBuild = await call('mixly_build_project', {
     board: 'default/arduino_avr',

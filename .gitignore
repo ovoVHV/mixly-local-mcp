@@ -1,0 +1,10 @@
+node_modules/
+nw_cache/
+.tmp_*/
+
+harness_integration/dist/
+harness_integration/*.png
+
+*.log
+*.tmp
+a.id.localeCompare*

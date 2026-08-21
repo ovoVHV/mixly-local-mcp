@@ -1,0 +1,22 @@
+# Mixly integration for the DeepSeek Harness web profile.
+- insert:
+    - id: mixly-local-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: mixly
+        transport: stdio
+        command: !!js process.env.MIXLY_MCP_NODE
+        args:
+          - !!js process.env.MIXLY_MCP_ROUTER
+        cwd: !!js process.env.MIXLY_HARNESS_WORKSPACE
+        env:
+          MIXLY_CONTEXT_FILE: !!js process.env.MIXLY_CONTEXT_FILE
+          MIXLY_MCP_NODE: !!js process.env.MIXLY_MCP_NODE
+          MIXLY_MCP_SERVER: !!js process.env.MIXLY_MCP_SERVER
+        toolCallTimeoutMs: 180000
+        failOnStartupError: true
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 10000
+          maxAttempts: 10

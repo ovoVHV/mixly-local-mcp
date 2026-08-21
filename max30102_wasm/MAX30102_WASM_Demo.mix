@@ -1,0 +1,62 @@
+<xml version="Mixly 2.0 rc4" board="Arduino AVR@Arduino/Genuino Uno" xmlns="http://www.w3.org/1999/xhtml">
+  <block type="base_setup" id="max-setup" x="20" y="20">
+    <statement name="DO">
+      <block type="serial_begin" id="max-serial">
+        <field name="serial_select">Serial</field>
+        <value name="CONTENT"><shadow type="math_number" id="max-baud"><field name="NUM">115200</field></shadow></value>
+        <next>
+          <block type="max30102_wasm_begin" id="max-begin">
+            <field name="SPEED">I2C_SPEED_FAST</field>
+            <value name="ADDRESS"><shadow type="math_number" id="max-address"><field name="NUM">87</field></shadow></value>
+            <next>
+              <block type="max30102_wasm_configure" id="max-config">
+                <field name="AVERAGE">4</field>
+                <field name="RATE">100</field>
+                <field name="WIDTH">411</field>
+                <field name="RANGE">4096</field>
+                <value name="POWER"><shadow type="math_number" id="max-power"><field name="NUM">31</field></shadow></value>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </statement>
+  </block>
+  <block type="max30102_wasm_update" id="max-update" x="20" y="420">
+    <next>
+      <block type="controls_if" id="max-if">
+        <value name="IF0">
+          <block type="logic_operation" id="max-condition">
+            <field name="OP">AND</field>
+            <value name="A">
+              <block type="max30102_wasm_finger" id="max-finger">
+                <value name="THRESHOLD"><shadow type="math_number" id="max-threshold"><field name="NUM">50000</field></shadow></value>
+              </block>
+            </value>
+            <value name="B"><block type="max30102_wasm_beat" id="max-beat"></block></value>
+          </block>
+        </value>
+        <statement name="DO0">
+          <block type="serial_print" id="max-print-bpm">
+            <field name="serial_select">Serial</field>
+            <field name="new_line">println</field>
+            <value name="CONTENT"><block type="max30102_wasm_average_bpm" id="max-average"></block></value>
+            <next>
+              <block type="serial_print" id="max-print-ir">
+                <field name="serial_select">Serial</field>
+                <field name="new_line">println</field>
+                <value name="CONTENT"><block type="max30102_wasm_ir" id="max-ir"></block></value>
+              </block>
+            </next>
+          </block>
+        </statement>
+        <next>
+          <block type="controls_delay" id="max-delay">
+            <field name="UNIT">delay</field>
+            <value name="DELAY_TIME"><shadow type="math_number" id="max-delay-value"><field name="NUM">10</field></shadow></value>
+          </block>
+        </next>
+      </block>
+    </next>
+  </block>
+</xml>

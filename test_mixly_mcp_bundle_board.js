@@ -237,7 +237,7 @@ async function main() {
   });
   assert.equal(initialized.result.serverInfo.name, 'mixly-local-builder');
 
-  const scanned = await call('mixly_scan_library', { board: 'default/arduino_esp32' });
+  const scanned = await call('mixly_scan_library', { board: 'default/arduino_esp32', full: true });
   assert.equal(scanned.board.id, 'default/arduino_esp32');
   assert.equal(scanned.official.discoveryMode, 'bundle+toolbox+source');
   assert.equal(scanned.official.bundleFileCount, 1);
@@ -266,7 +266,8 @@ async function main() {
   assert(!scanned.availableBlockTypes.includes('lazy_only'));
 
   const profiledScan = await call('mixly_scan_library', {
-    board: 'Fixture ESP32 Family@Fixture ESP32'
+    board: 'Fixture ESP32 Family@Fixture ESP32',
+    full: true
   });
   assert.equal(profiledScan.board.id, 'default/arduino_esp32');
   assert.equal(profiledScan.board.boardType, 'Fixture ESP32 Family');
@@ -274,7 +275,7 @@ async function main() {
   assert.equal(profiledScan.board.fqbn, 'fixture:esp32:dev');
   assert.equal(profiledScan.board.xmlPath, 'xml/esp32.xml');
 
-  const fallbackScan = await call('mixly_scan_library', { board: 'default/python' });
+  const fallbackScan = await call('mixly_scan_library', { board: 'default/python', full: true });
   assert.equal(fallbackScan.official.discoveryMode, 'source+toolbox');
   assert.equal(fallbackScan.official.bundleFileCount, 0);
   assert.deepEqual(fallbackScan.blockTypes, ['source_fallback']);
@@ -283,7 +284,8 @@ async function main() {
   const specifications = await call('mixly_get_block_specs', {
     board: 'default/arduino_esp32',
     blockTypes: ['esp_now_send', 'esp_now_receive', 'direct_probe', 'inline_function_probe', 'inline_arrow_probe'],
-    includeSource: true
+    includeSource: true,
+    includeExamples: true
   });
   assert.equal(specifications.found, 5);
   assert.deepEqual(specifications.unknownTypes, []);

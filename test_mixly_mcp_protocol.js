@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const packageMetadata = require('./package.json');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -56,9 +57,9 @@ async function main() {
     clientInfo: { name: 'mixly-mcp-test', version: '1.0.0' }
   });
   assert.equal(initialized.result.serverInfo.name, 'mixly-local-builder');
-  assert.equal(initialized.result.serverInfo.version, '2.3.0');
-  assert.match(initialized.result.instructions, /libraries\/ThirdParty/);
-  assert.match(initialized.result.instructions, /无需修改 MCP/);
+  assert.equal(initialized.result.serverInfo.version, packageMetadata.version);
+  assert.match(initialized.result.instructions, /ThirdParty/);
+  assert.match(initialized.result.instructions, /quer(?:y|ies)/);
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`);
 
   const listed = await request('tools/list');
@@ -88,17 +89,34 @@ async function main() {
   const compileDefinition = listed.result.tools.find((tool) => tool.name === 'mixly_compile');
   const workflowDefinition = listed.result.tools.find((tool) => tool.name === 'mixly_project_workflow');
   const equivalenceDefinition = listed.result.tools.find((tool) => tool.name === 'mixly_verify_equivalence');
+  const scanDefinition = listed.result.tools.find((tool) => tool.name === 'mixly_scan_library');
+  const specsDefinition = listed.result.tools.find((tool) => tool.name === 'mixly_get_block_specs');
+  const detectDefinition = listed.result.tools.find((tool) => tool.name === 'mixly_detect_environment');
   for (const definition of [compileDefinition, workflowDefinition]) {
     assert.equal(definition.inputSchema.properties.librariesPaths.type, 'array');
     assert.equal(definition.inputSchema.properties.mixlyLibraries.type, 'array');
   }
   assert.equal(compileDefinition.inputSchema.properties.board.type, 'string');
+  assert.match(compileDefinition.description, /WASM/);
   assert.deepEqual(equivalenceDefinition.inputSchema.properties.mode.enum, ['report', 'behavioral-strict', 'exact']);
   assert.equal(workflowDefinition.inputSchema.properties.equivalenceSupportPaths.type, 'array');
+  assert.equal(workflowDefinition.inputSchema.properties.autoImportLibraries.type, 'boolean');
+  assert.equal(workflowDefinition.inputSchema.properties.libraryNames.type, 'array');
+  assert.equal(workflowDefinition.inputSchema.properties.libraryZipPaths.type, 'array');
+  assert.equal(workflowDefinition.inputSchema.properties.desktopCompile.type, 'boolean');
+  assert.match(workflowDefinition.description, /默认.*WASM/);
+  assert.equal(scanDefinition.inputSchema.properties.query.type, 'string');
+  assert.equal(scanDefinition.inputSchema.properties.queries.type, 'array');
+  assert.equal(scanDefinition.inputSchema.properties.queries.maxItems, 8);
+  assert.equal(scanDefinition.inputSchema.properties.includeSpecs.type, 'boolean');
+  assert.equal(scanDefinition.inputSchema.properties.full.type, 'boolean');
+  assert.equal(scanDefinition.inputSchema.properties.refresh.type, 'boolean');
+  assert.equal(specsDefinition.inputSchema.properties.includeExamples.type, 'boolean');
+  assert.equal(detectDefinition.inputSchema.properties.details.type, 'boolean');
 
   const scanned = await request('tools/call', {
     name: 'mixly_scan_library',
-    arguments: { board: 'default/arduino_avr' }
+    arguments: { board: 'default/arduino_avr', full: true }
   });
   assert.equal(scanned.result.isError, undefined);
   assert(scanned.result.structuredContent.official.blockTypeCount > 100);
@@ -108,6 +126,40 @@ async function main() {
   assert(scanned.result.structuredContent.availableBlockTypes.includes('DHT'));
   assert(scanned.result.structuredContent.availableBlockTypes.includes('mrtduino_ledlight'));
   assert(scanned.result.structuredContent.thirdPartyBlockTypes.includes('emakefun_tts20_play_text'));
+
+  const compactScan = await request('tools/call', {
+    name: 'mixly_scan_library',
+    arguments: { board: 'default/arduino_avr', query: 'rgb' }
+  });
+  assert.equal(compactScan.result.structuredContent.resultMode, 'filtered');
+  assert.equal(compactScan.result.structuredContent.cache.hit, true);
+  assert(compactScan.result.structuredContent.availableBlockTypes.includes('display_rgb'));
+  assert(compactScan.result.structuredContent.availableBlockTypes.length <= 60);
+  assert(compactScan.result.content[0].text.length < JSON.stringify(compactScan.result.structuredContent).length);
+
+  const multiScan = await request('tools/call', {
+    name: 'mixly_scan_library',
+    arguments: {
+      board: 'default/arduino_avr', queries: ['display_rgb', 'DHT'], limit: 5, includeSpecs: true
+    }
+  });
+  assert.equal(multiScan.result.isError, undefined);
+  assert.equal(multiScan.result.structuredContent.resultMode, 'multi-filtered');
+  assert.deepEqual(multiScan.result.structuredContent.queries, ['display_rgb', 'DHT']);
+  assert.equal(multiScan.result.structuredContent.matches.length, 2);
+  assert(multiScan.result.structuredContent.availableBlockTypes.includes('display_rgb'));
+  assert(multiScan.result.structuredContent.availableBlockTypes.includes('DHT'));
+  assert(multiScan.result.structuredContent.specs.some((spec) => spec.type === 'display_rgb'));
+  assert(multiScan.result.structuredContent.specs.some((spec) => spec.type === 'DHT'));
+  assert(multiScan.result.structuredContent.specs.length <= 20);
+
+  const summaryScan = await request('tools/call', {
+    name: 'mixly_scan_library',
+    arguments: { board: 'default/arduino_avr' }
+  });
+  assert.equal(summaryScan.result.structuredContent.resultMode, 'summary');
+  assert.deepEqual(summaryScan.result.structuredContent.availableBlockTypes, []);
+  assert.equal(summaryScan.result.structuredContent.cache.hit, true);
 
   const specs = await request('tools/call', {
     name: 'mixly_get_block_specs',
@@ -128,6 +180,17 @@ async function main() {
   const optionalTextSpec = specs.result.structuredContent.specs.find((item) => item.type === 'nanoenv_oled_print');
   assert.deepEqual(optionalTextSpec.contract.optionalValueInputs, ['VALUE']);
   assert.deepEqual(optionalTextSpec.contract.valueDefaults, [{ name: 'VALUE', fallbackCode: '""' }]);
+  assert.equal(specs.result.structuredContent.examplesIncluded, false);
+  assert.equal(Object.hasOwn(specs.result.structuredContent.specs[0], 'exampleProjects'), false);
+
+  const cachedSpecs = await request('tools/call', {
+    name: 'mixly_get_block_specs',
+    arguments: {
+      board: 'default/arduino_avr',
+      blockTypes: ['DHT', 'display_rgb', 'controls_if', 'variables_declare', 'nanoenv_oled_print']
+    }
+  });
+  assert.equal(cachedSpecs.result.structuredContent.cache.hit, true);
 
   const inspectedHanduan = await request('tools/call', {
     name: 'mixly_inspect_library',
@@ -280,7 +343,7 @@ async function main() {
 
   const inheritedScan = await request('tools/call', {
     name: 'mixly_scan_library',
-    arguments: { board: 'default/arduino_esp32s3' }
+    arguments: { board: 'default/arduino_esp32s3', full: true }
   });
   assert.equal(inheritedScan.result.structuredContent.board.id, 'default/arduino_esp32s3');
   assert(inheritedScan.result.structuredContent.blockTypes.includes('controls_if'));
@@ -354,6 +417,9 @@ async function main() {
   });
   assert(detected.result.structuredContent.boards.length > 5);
   assert(detected.result.structuredContent.boards.some((board) => board.id === 'default/arduino_avr'));
+  assert.equal(detected.result.structuredContent.detailsIncluded, false);
+  assert.equal(Object.hasOwn(detected.result.structuredContent.boards[0], 'profiles'), false);
+  assert.equal(detected.result.structuredContent.generationAwareWorkflow.finalTool, 'mixly_project_workflow');
 
   const profiles = await request('tools/call', {
     name: 'mixly_get_board_profiles', arguments: { board: 'default/arduino_avr' }

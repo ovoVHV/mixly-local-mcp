@@ -1,4 +1,4 @@
-# Mixly Local MCP 2.3.0
+# Mixly Local MCP 2.5.4
 
 下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
 
@@ -12,6 +12,84 @@
 - 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
 
 以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.5.4 更新说明
+
+- `mixly_scan_library` 新增 `queries` 与 `includeSpecs`：最多 8 个能力一次扫描，并在同一结果中附带最多 20 个候选的 `type/owner/contract/defaultXml`，减少重复工具调用和 shell 搜索。
+- MCP 初始化规则要求新工程使用 `mixly_build_project.tree/treePath`，不再手写 `.mix` XML；结构树会自动转义 `<`、嵌套 `next` 并校验真实输入契约。
+- XML 解析器会在启动 Mixly 前拒绝游离、重复或包含错误子节点的 `<next>`，直接给出结构错误和修复提示，避免真实 Blockly 只加载半棵树后再返工。
+- 已用 Mixly 4 ESP32 的 122 节点健康监测工程验证：静态节点与真实 Blockly 节点均为 122，未知 type 为 0。
+
+## 2.5.3 更新说明
+
+- Mixly 4 在当前板卡页直接把新工程写入现有 Blockly 工作区，不再通过整页导航模拟“实时插入”；页面、Harness 会话和 AI 侧栏都保持不变。
+- 打开工程、导入插件和工作流会先比较当前板卡，板卡相同时不刷新；确需切换板卡或页面重载时，AI 侧栏会从会话状态自动恢复，手动关闭后则不会自行重开。
+- 实时加载后自动把第一个顶层积木移到 AI 面板左侧的可见区域，避免积木已渲染却被侧栏盖住。
+
+## 2.5.2 更新说明
+
+- Mixly 4 AI 按钮改为注入所有板卡共用的 `boards/index.html`，不再依赖从 Arduino Uno 页面挂载的 OPFS 插件；Arduino AVR、ESP32 和 MicroPython 等板卡都会显示。
+- OPFS 插件继续作为兼容兜底，全局适配器带幂等保护，不会重复生成按钮或侧栏。
+- Harness 精简工具面增加 `mixly_build_project`：AI 每完成一组可运行的结构树即可立即刷新 Mixly 4 Blockly，不必等最终导库和 WASM 编译；禁止为了动画逐块重发完整工程。
+
+## 2.5.1 更新说明
+
+- 修复 Harness 会话串代：MCP 上下文在进程启动时锁定，运行中修改活动环境文件不会把 Mixly 4 任务静默切到 Mixly 2。
+- 同一 Mixly 重复打开会复用现有进程；切换 2/3/4 或安装目录时会完整重启 Harness，并在侧栏标题显示当前锁定代际。
+- Harness 工作目录直接绑定当前 Mixly 根目录；API 配置和聊天数据继续保留，MCP 子进程则固定在启动时选中的代际。
+- 按钮只接受真实用户点击，防止后台页面用脚本触发后抢占当前环境。
+- MCP 工具默认继承 Harness 锁定的 Mixly 4 CDP 端口，AI 无需每次填写 `cdpPort`，不会把实际 `9347` 错查成 `9333`。
+
+## 2.5.0 更新说明
+
+- 新增 Mixly 内置 AI 客户端：Mixly 2/3 写入轻量顶栏适配器，Mixly 4 导入 `MixlyHarness_Mixly4_Plugin.zip`；插件只增加一个图标按钮，不向工具箱塞积木。
+- 按钮在 Mixly 主窗口右侧打开官方 DeepSeek Harness，Harness 通过官方 `@deepseek-ai/dsh-mcp-client` 加载本 MCP。
+- 三个 Mixly 代际共用一个 Harness 运行时；2.5.1 起，切换安装目录会明确重启并锁定上下文，不再在同一聊天连接中动态换根目录。
+- Mixly 4 会根据当前页面 origin 自动发现真实 CDP 端口；客户端使用持久 iframe 侧栏，不再创建会短暂出现后关闭的 NW.js 远程窗口。
+- Harness 默认只公开 9 个高频工作流工具的 schema，完整 19 个工具仍保持可调用，减少工具上下文和无效往返。
+
+### 安装 Mixly AI 按钮
+
+```powershell
+node harness_integration\install.js `
+  --mcp-source . `
+  --mixly2-home C:\Path\To\Mixly2 `
+  --mixly3-home C:\Path\To\Mixly3 `
+  --mixly4-home C:\Path\To\Mixly4
+```
+
+首次安装会把便携 Node.js 24 和官方 DeepSeek Harness 安装到 `%LOCALAPPDATA%\MixlyHarness`。Mixly 2/3 会直接写入带一次性备份的适配脚本；Mixly 4 会把插件 ZIP 放到安装根目录，再通过 Mixly 插件管理器或 `mixly_import_library` 导入。Harness 的 API Key 只在 Harness 自己的设置界面填写。
+
+纯网页方式打开 Mixly 3 时没有本地 Node 桥接，AI 按钮会保持禁用；打包的 Electron/NW.js 桌面版才会启动本地 Harness。
+
+## 2.4.3 更新说明
+
+- `mixly_scan_library` 默认只返回摘要；按源码能力传 `query` 获取少量候选，`full=true` 仅用于全集审计。扫描与规格结果缓存 30 秒，建库/导库后自动失效。
+- `mixly_get_block_specs` 默认跳过示例工程，只有需要真实示例时才传 `includeExamples=true`；`mixly_detect_environment` 默认不运行 Arduino CLI，准备 CLI 编译时才传 `probeCli=true`。
+- 工具文本结果只保留短摘要，完整对象只放在 `structuredContent`，不再把大型结果重复两遍占用上下文。
+- Mixly 4 编译按钮点击增加输出确认与重试，避免“按钮坐标可见但命令未触发”后空等到超时。
+
+## 2.4.2 更新说明
+
+- MCP 初始化指令和 `mixly_detect_environment.generationAwareWorkflow` 会在识别到 Mixly 4 后明确告诉 AI：插件位于 OPFS，缺失 C/C++ 依赖必须通过 `wasmSketchFiles` 注入，Arduino CLI 不是桌面 WASM 验证。
+- `mixly_project_workflow` 成为 Mixly 4 的真正闭环：可复用已有 `.mix`，自动从工程 block type 识别暂存插件，完成打包、`PluginManager` 导入、工程打开、代码生成，并默认点击可见桌面按钮等待 WASM 编译结果。
+- `mixly_launch` 会优先发现安装目录内的 64 位 NW.js/SDK，启动后主动进入目标板卡页面并等待 Blockly/PluginManager；只有 HTTP、没有 CDP 的实例不再误报为可自动化。
+- 修复编译按钮被收进“更多”菜单时工作流找不到按钮的问题，并精简工作流返回内容，避免把完整 OPFS manifest 占用 AI 上下文。
+
+## 2.4.1 更新说明
+
+- `mixly_create_library` 新增 `wasmSketchFiles`，可把平铺的 `.h/.hpp/.c/.cc/.cpp` 精确注入 Mixly 4 浏览器编译器的 `sketchFiles`，不会再生成 `.h.h` 或 `.cpp.h` 伪头文件。
+- Mixly 4 插件导入仍调用官方 `PluginManager.installPlugin`，并为嵌套 Arduino 库补齐 OPFS 父目录；大型插件改用表达式临时文件传给 CDP，避免 Windows `ENAMETOOLONG`。
+- 增加可见桌面窗口的真实 WASM 点击编译回归。MAX30102 示例在 Arduino AVR UNO 上完成编译、链接及资源统计，编译期间窗口进程保持存活。
+
+## 2.4.0 更新说明
+
+- 兼容 Mixly 2、Mixly 3 和 Mixly 4；按本机目录结构自动识别 Electron、源码树和 NW.js/HTTP 运行时，不把附件路径或固定板卡当作环境。
+- Mixly 4 使用 `package.json` 的静态服务入口（默认 `http://localhost:65234`），工程打开和代码生成通过其编辑器 API 工作；CDP 不可用时会明确返回诊断，不会终止用户已有实例。
+- Mixly 4 的 Arduino 板卡直接读取随 WASM 编译器提供的 `libraries.manifest.json`，`mixly_scan_arduino_libraries` 可返回库名、版本、头文件、依赖和归档来源。
+- Mixly 4 自定义库使用插件格式：ZIP 根部必须有 `plugin.json`、`index.xml` 和 ES module `index.js`；安装走 `PluginManager`/OPFS，不再写入只读的 `ThirdParty` 板卡目录。
+- Mixly 2/3 发布 ZIP 保持 0 个目录条目；Mixly 4 插件使用根部入口文件，嵌套载荷则带必要的父目录条目。
+- 新增 Mixly 4 HTTP、WASM 库清单和插件生成/导入回归测试；MCP 协议现有 19 个工具。
 
 ## 2.3.0 更新说明
 
@@ -31,7 +109,7 @@
 - 不固定 FQBN。AI 必须根据用户的实际板卡和本机已安装核心选择 FQBN。
 - 不捆绑 Arduino CLI、板卡核心和第三方 Arduino 库。
 - 建议不要把完整业务程序或多个业务函数封装成少量黑盒积木；这种粒度问题只提示，不阻止 AI 按用户目标实现。
-- 官方目录和 `libraries/ThirdParty` 都是可复用的本地积木来源。每次扫描都读取当前磁盘内容，后续新增积木无需修改 MCP。
+- Mixly 2/3 的官方目录和 `libraries/ThirdParty`、Mixly 4 的官方板卡资源和 OPFS 插件都是可复用的本地积木来源；扫描读取当前本机内容，后续新增积木无需修改 MCP。
 - 候选块应读取真实规格，不根据块名猜字段和输入。
 - 图形界面的变量、函数和参数建议使用自然中文；协议字符串和循环下标可以保留原文。命名偏好只产生提示。
 - 建议把全局变量声明通过 `next` 连接为一条栈，并给顶层积木稳定、无重叠的坐标；布局问题只产生提示。
@@ -39,14 +117,14 @@
 - 只有无效 XML/JavaScript、当前板卡没有该 block type、块定义或生成器缺失、真实 Blockly 节点丢失、代码生成或编译失败等确定不可用的问题才报错。
 - 源码等价性检查是保守的静态审计，用来主动发现遗漏的保护条件、提示文本、常量和副作用调用；它不是形式化证明，也不替代真机测试。
 - 编译结果会保留 Flash/SRAM 等资源占用诊断。接近板卡上限时属于部署风险，AI 应明确提示，不能只根据“编译通过”判断设备运行可靠。
-- ZIP 只有文件条目，没有目录条目，避免 Mixly 导入时出现 `EISDIR`。
+- Mixly 2/3 ZIP 只有文件条目，避免旧导入器出现 `EISDIR`；Mixly 4 插件入口位于 ZIP 根部，并为嵌套 Arduino 库写入必要的父目录条目。
 
 ## 本地部署包
 
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.3.0.zip
+Mixly_Local_MCP_v2.5.4.zip
 ```
 
 解压后目录包含：
@@ -58,6 +136,8 @@ MixlyLocalMCP/
   test_mixly_code_equivalence.js
   validate_mixly_workspace.js
   mixly_mcp_call.js
+  Mixly4_MCP_Server.cmd
+  harness_integration/
   package.json
   package-lock.json
   node_modules/
@@ -67,7 +147,7 @@ MixlyLocalMCP/
 依赖已经放入 ZIP。用户只需要：
 
 - Node.js 18 或更高版本
-- 一份本机 Mixly 2.x 或 Mixly 3.x
+- 一份本机 Mixly 2.x、Mixly 3.x 或 Mixly 4.x
 - 支持本地 STDIO MCP 的 AI 客户端
 - 需要编译 C/C++ 时，本机存在可用的 `arduino-cli`
 
@@ -79,7 +159,7 @@ MCP 按以下顺序寻找 Mixly：
 2. MCP 进程的工作目录 `cwd`
 3. MCP 脚本上一级目录
 
-只要该目录中存在打包版的 `resources/app/src/boards`，或源码树的 `boards`，就会被识别为 Mixly 根目录。附件、聊天记录或示例中出现的路径不会被当成本机目录；实际读写始终以本机 `MIXLY_HOME` 为准。
+只要该目录中存在打包版的 `resources/app/src/boards`，或源码树/Mixly 4 安装根部的 `boards`，就会被识别为 Mixly 根目录。根部同时存在 `boards` 且 `package.json` 的 `node-main` 指向 `static-server/server.js` 时识别为 Mixly 4。附件、聊天记录或示例中出现的路径不会被当成本机目录；实际读写始终以本机 `MIXLY_HOME` 为准。
 
 ## Codex 配置
 
@@ -106,6 +186,11 @@ MIXLY_HOME = "C:\\Path\\To\\Mixly"
 ```
 
 配置完成后重启 Codex，然后使用 `/mcp` 检查连接。
+
+Mixly 4 客户端也可直接把命令配置为 `Mixly4_MCP_Server.cmd`，同时设置
+`MIXLY_HOME`（或 `MIXLY4_HOME`）为 Mixly 4 安装根目录。该入口用于避免客户端
+把工作目录中的 Mixly 2/3 误识别为当前目标；修改 MCP 配置后必须重新连接，
+客户端才会读取包含 OPFS、`wasmSketchFiles` 和桌面 WASM 编译规则的初始化说明。
 
 ## Claude Desktop、Cursor、Cline
 
@@ -137,21 +222,22 @@ MIXLY_HOME = "C:\\Path\\To\\Mixly"
 | `mixly_detect_environment` | 枚举 Mixly 根目录、全部板卡、CDP、CLI 候选、版本和已安装核心 |
 | `mixly_get_board_profiles` | 读取板卡本地型号、基础 FQBN、配置选项和型号工具箱 XML |
 | `mixly_analyze_source` | 分析 C/C++、MicroPython 或 Python 源码 |
-| `mixly_scan_library` | 扫描选定板卡的官方积木、生成器和第三方积木库 |
+| `mixly_scan_library` | 单关键词或多能力 `queries` 扫描本地积木；可用 `includeSpecs` 同时返回真实契约 |
+| `mixly_scan_arduino_libraries` | 按板卡扫描 Arduino 库；Mixly 4 读取 WASM 清单，Mixly 2/3 扫描本地目录 |
 | `mixly_get_block_specs` | 返回候选块真实 XML、字段、输入、shadow、连接和生成器接口 |
 | `mixly_inspect_library` | 学习标准第三方库目录、语言、媒体、Arduino 库和图片模式 |
-| `mixly_create_library` | 为目标板创建缺失的底层原语，默认生成标准库目录 |
+| `mixly_create_library` | 为目标板创建缺失的底层原语；Mixly 2/3 生成传统库，Mixly 4 可生成插件并通过 `wasmSketchFiles` 注入浏览器编译源文件 |
 | `mixly_build_project` | 从结构树或大型 `treePath` 构建 `.mix`，并在序列化前校验块输入契约、推导 `controls_if` mutation |
 | `mixly_save_project` | 静态检查已有 XML 后原子写入 `.mix` |
-| `mixly_package_library` | 递归打包积木库，保持 0 个目录条目 |
-| `mixly_launch` | 启动或复用带 CDP 端口的本机 Mixly |
-| `mixly_import_library` | 调用 Mixly 自身 API 真实导入 ZIP |
+| `mixly_package_library` | 递归打包积木库；Mixly 2/3 保持 0 个目录条目，Mixly 4 平铺插件根目录并保留嵌套载荷所需的父目录条目 |
+| `mixly_launch` | 启动或复用本机 Mixly；Mixly 4 优先选择可自动化的 64 位 NW.js 并进入目标板卡页 |
+| `mixly_import_library` | 调用 Mixly 自身 API 导入 ZIP；Mixly 4 使用 `PluginManager`/OPFS |
 | `mixly_open_project` | 使用动态发现的板卡配置打开 `.mix` |
 | `mixly_validate_project` | 在真实 Blockly 中检查节点、连接、中文名称、孤立块和重叠；节点丢失时返回类型和父输入诊断 |
 | `mixly_generate_code` | 自动选择当前板卡的 Blockly 生成器，输出 `.ino`、`.py` 等代码 |
 | `mixly_verify_equivalence` | 对参考源码和积木生成代码执行 `report`、`behavioral-strict` 或 `exact` 静态审计 |
-| `mixly_project_workflow` | 一次完成构建、启动、打开、真实验证、代码生成、等价性审计和可选编译 |
-| `mixly_compile` | 调用本机 `arduino-cli`，支持多个隔离库目录及指定 Mixly ThirdParty 库 |
+| `mixly_project_workflow` | 最终闭环；Mixly 4 自动打包/导入工程引用插件，并默认执行可见桌面 WASM 编译 |
+| `mixly_compile` | 调用本机 `arduino-cli` 做生成代码兼容检查；Mixly 4 会明确标记它不等同于桌面 WASM 编译 |
 
 ## AI 推荐工作流
 
@@ -161,34 +247,35 @@ mixly_detect_environment
   -> mixly_get_board_profiles(board=<动态板卡 id>)
   -> 按用户真实型号选择 FQBN 和配置项
   -> mixly_analyze_source
-  -> mixly_scan_library(board=<动态板卡 id>)
+  -> mixly_scan_library(board=<动态板卡 id>, queries=[<源码能力关键词>...], includeSpecs=true)
+  -> mixly_scan_arduino_libraries(board=<动态板卡 id>)
   -> 从 availableBlockTypes 选择官方或 ThirdParty 候选
-  -> mixly_get_block_specs(blockTypes=<候选本地块>)
+  -> mixly_get_block_specs(blockTypes=<尚未随扫描返回的复杂动态块>)
   -> 按真实 defaultXml 设计结构树
   -> mixly_inspect_library（需要自定义库时先看标准结构）
   -> mixly_create_library（仅确认缺少底层原语时）
-  -> mixly_package_library
-  -> mixly_launch
-  -> mixly_import_library
   -> mixly_project_workflow(
        treePath=<大型 JSON 树>,
        sourcePath=<原始主源码>,
        equivalenceSupportPaths=<生成端辅助源码列表>,
        equivalenceMode=behavioral-strict,
        equivalenceRequiredPatterns=<关键业务规则>,
-       compile=<是否编译>
+       desktopCompile=<Mixly 4 默认 true>,
+       compile=<是否额外做 Arduino CLI 兼容检查>
      )
 ```
 
 如果环境探测中没有用户需要的板卡，AI 应帮助用户安装对应 Mixly 板卡支持或 Arduino core，然后重新探测，不能偷偷换成固定板卡。板卡选择器也支持 `板卡家族@具体型号`，例如 `default/arduino_avr@Arduino Nano`；具体名称必须来自 `mixly_get_board_profiles` 的本机结果。
 
-`mixly_project_workflow` 是最终闭环工具，不代替前面的源码分析、动态扫描和真实规格读取。传入 `sourcePath` 或 `sourceText` 时，工作流默认用 `report` 模式生成等价性报告；不传源码则跳过该阶段。`equivalenceMode` 可改为 `behavioral-strict` 或 `exact`，生成端自定义库等辅助 `.h/.cpp/.ino` 用 `equivalenceSupportPaths` 传入，必须保留的业务规则用 `equivalenceRequiredPatterns` 明确声明。C/C++ 编译仍要求 AI 明确传入用户板卡的 `fqbn` 或 `fqbns`，不会把 ESP32、Nano 或任何其他板卡写成默认值。
+`mixly_project_workflow` 是最终闭环工具，不代替前面的源码分析、动态扫描和真实规格读取。Mixly 4 默认 `autoImportLibraries=true`：它从工程 type 的真实 owner 推断暂存插件，自动打包并导入；也可用 `libraryNames` 或 `libraryZipPaths` 强制指定。C/C++ 板卡默认 `desktopCompile=true`，结果的 `finalCompileEngine` 必须是 `browser-wasm` 才能称为 Mixly 4 桌面编译通过。传入 `sourcePath` 或 `sourceText` 时，工作流默认用 `report` 模式生成等价性报告；`equivalenceMode` 可改为 `behavioral-strict` 或 `exact`。只有额外启用 Arduino CLI 兼容检查时才需要明确传入 `fqbn` 或 `fqbns`。
 
 ## 本地积木兼容规则
 
-`mixly_detect_environment` 还会读取各板卡目录的 `config.json` 和 `boards.json`，在 `profiles` 中返回型号名、FQBN、型号工具箱 XML 与配置键。后续工具的 `board` 参数既可使用原有板卡 id，也可使用 `板卡id@型号`、`boardType@型号`、唯一型号名或 FQBN；例如 `default/arduino_esp32@ESP32 Dev Module`。这让型号专用工具箱和编译目标保持一致。
+`mixly_detect_environment` 默认只返回板卡摘要与 `profileCount`。需要型号名、FQBN、型号工具箱 XML 和配置项时调用 `mixly_get_board_profiles`；诊断完整环境时可传 `details=true`。后续工具的 `board` 参数既可使用板卡 id，也可使用 `板卡id@型号`、`boardType@型号`、唯一型号名或 FQBN；例如 `default/arduino_esp32@ESP32 Dev Module`。
 
-`mixly_scan_library` 会在每次调用时重新扫描板卡官方脚本和 `libraries/ThirdParty`，因此以后安装的新积木也会自动出现。Mixly 3 板卡同时支持 `main.bundle.*.js`、无引号 XML 属性、`xml/`、`origin/xml/`、`default_src`/`extend_src` 伴随源码和本地 `.mix` 示例。只扫描非空主 bundle 及 `index.xml` 明确引用的脚本，不会把 Pyodide 等 lazy chunk 误当作当前板卡积木；零字节占位 bundle 会自动回退到伴随源码。
+`mixly_scan_library` 的完整扫描结果在常驻 MCP 进程中缓存 30 秒；传 `refresh=true` 可立即刷新，`mixly_create_library` 和 `mixly_import_library` 成功后也会自动清空缓存。默认调用只返回计数与类型族摘要；单能力可传 `query="rgb"`，复杂任务优先传 `queries=["digital read","eeprom","oled"]`。`includeSpecs=true` 会把最多 20 个候选的精简真实契约一起返回。只有确实需要所有 type 时才传 `full=true`。Mixly 3 仍支持 `main.bundle.*.js`、无引号 XML 属性、`xml/`、`origin/xml/`、`default_src`/`extend_src` 伴随源码和本地 `.mix` 示例。
+
+Mixly 4 的已安装插件位于浏览器 OPFS，而不是板卡目录。MCP 通过运行中页面的 `PluginManager.fs` 读取 `plugins/libraries/<boardType>/installed.json` 以及对应版本目录，并把插件 `index.xml`、`index.js` 纳入扫描、规格读取和库检查。读取 OPFS 需要可用的 Mixly 4 HTTP 页面和 CDP；缺少自动化通道时会返回明确的运行时诊断。
 
 `blockTypes` 是官方类型，`thirdPartyBlockTypes` 是第三方类型，`availableBlockTypes` 是两者的合集。打包板卡以运行时 `Object.assign(Blockly.Blocks/forBlock, ...)` 注册表为准，并按赋值顺序处理覆盖；可读伴随源码用于返回更清晰的定义和生成器片段。AI 可复用其中任何能表达需求的本地积木。
 
@@ -207,6 +294,7 @@ mixly_detect_environment
 - 默认 shadow 从 `defaultXml` 复制，只修改用户要填写的值。
 - 生成器允许插槽留空并提供回退值时，契约会在 `optionalValueInputs` 和 `valueDefaults` 中列出，例如文本输入留空后生成 `""`；这类空位不需要识图，也不会被误报成缺失结构。
 - `mixly_build_project` 会在写 XML 前按本机 block 规格校验 `fields`、`values` 和 `statements`；输入名不存在，或把 `value` 错放进 `statements` 等连接种类不匹配时，会返回树路径和该块允许的契约，避免到真实加载阶段才丢掉整棵子树。动态块和允许留空的输入不按“必填”误判。
+- 新工程不要手写 `.mix` XML。大型结构先写 JSON 再传 `treePath`；序列化器会自动处理 XML 转义与 `next` 嵌套。兼容导入旧 XML 时，游离或重复的 `<next>` 会在打开软件前失败。
 - `controls_if` 会根据实际的 `IF0/DO0`、`IF1/DO1` 等分支以及 `ELSE` 自动推导 `elseif`/`else` mutation；函数定义和调用等其他动态块仍应按真实 `defaultXml` 保留 mutation。
 - `mixly_validate_project` 会比较 XML 节点与真实 Blockly 加载后的节点；少一个也失败，并返回丢失节点的 type、id、树路径和父块输入位置，便于直接定位错误的 `value`/`statement` 名或 mutation。
 
@@ -236,7 +324,7 @@ mixly_detect_environment
 
 `Emakefun_tts20` 展示了 `block/`、`generator/`、`css/`、`examples/`、`libraries/`、`media/`、`config.json`、`index.xml` 的完整结构；`handuan` 还展示了 `language/` 和 `Blockly.FieldImage`。使用 `mixly_inspect_library` 可动态读取这些模式。
 
-`mixly_create_library` 默认建立：
+Mixly 2/3 中，`mixly_create_library` 默认建立：
 
 ```text
 LibraryName/
@@ -245,6 +333,17 @@ LibraryName/
   config.json
   index.xml
 ```
+
+Mixly 4 中不会改写安装目录的板卡文件，而是在 `.mixly-mcp-staging/libraries/<boardType>/` 生成待打包插件：
+
+```text
+LibraryName/
+  plugin.json
+  index.xml
+  index.js
+```
+
+`index.xml` 的 `<category>` 是直接子节点；`index.js` 以 ES module 导出 `blocks`、`generators` 和 `languages`。`mixly_package_library` 对 Mixly 4 生成根部平铺 ZIP，不增加 `LibraryName/` 外层目录，但会为嵌套载荷加入父目录条目；随后 `mixly_import_library` 调用 `PluginManager.installPlugin`，通过自动创建父目录的存储处理器安装到 OPFS。`wasmSketchFiles` 用于注入浏览器 WASM 编译所需的平铺 C/C++ 源文件，`extraFiles` 仍用于传统 Arduino `libraries/`、媒体和示例。
 
 媒体、语言、CSS、Arduino 库和示例通过 `extraFiles` 添加。若用户明确要求块图标或图片选项，可记录：
 
@@ -387,6 +486,22 @@ Mixly 3 bundle、无引号 XML、示例和 lazy chunk 回归测试：
 node tools\test_mixly_mcp_bundle_board.js
 ```
 
+Mixly 4 HTTP/CDP 运行时和 WASM Arduino 库清单回归测试：
+
+```powershell
+node tools\test_mixly4_runtime.js
+node tools\test_mixly4_wasm_library_catalog.js
+node tools\test_mixly4_plugin_library_fixture.js
+```
+
+MAX30102 可见桌面窗口点击编译测试（先以 CDP 启动 Mixly 4）：
+
+```powershell
+$env:MIXLY_HOME='C:\Path\To\Mixly4'
+$env:MIXLY_CDP_PORT='9347'
+node tools\test_mixly4_visible_wasm_compile.js
+```
+
 真实 Mixly 导入、代码生成和本地编译测试：
 
 ```powershell
@@ -412,13 +527,13 @@ node tools\test_mixly_local_mcp_package.js
 问题标题建议使用：
 
 ```text
-[MCP 2.3.0][板卡 id@型号] 简短现象
+[MCP 2.5.4][板卡 id@型号] 简短现象
 ```
 
 问题正文至少包含：
 
 - MCP 版本、Mixly 版本、操作系统、Node.js 版本；涉及编译时再附 Arduino CLI 版本。
-- `MIXLY_HOME` 对应的是 Mixly 2 打包目录还是 Mixly 3 源码树。路径可脱敏，但请保留目录结构特征。
+- `MIXLY_HOME` 对应的是 Mixly 2 打包目录、Mixly 3 源码树还是 Mixly 4 安装根目录。路径可脱敏，但请保留目录结构特征。
 - `mixly_get_board_profiles` 返回的板卡 id、具体型号和 FQBN；不要只写“ESP32”或“Nano”。
 - 出错的 MCP 工具名称、已脱敏的参数、最小复现步骤、期望结果和实际结果。
 - 可最小复现的 `.mix`、积木库 ZIP、源代码片段或工程树 JSON。大型工程请删去与问题无关的业务代码。
@@ -430,8 +545,9 @@ node tools\test_mixly_local_mcp_package.js
 
 - 动态发现 21 个板卡入口，包含默认板卡和 `boards/extend` 扩展板。
 - 发现本机 AVR、ESP32 和 ESP8266 Arduino cores。
-- MCP 2.3.0 协议共 18 个工具；AVR 当前扫描到 529 个官方类型，并把官方和 `ThirdParty` 类型合并到 `availableBlockTypes`。
+- MCP 2.5.4 协议共 19 个工具；Harness 精简模式公开 9 个工作流工具 schema。AVR 完整模式扫描到 529 个官方类型，多能力扫描和契约可在一次调用中返回。
 - Mixly 3 ESP32 源码树扫描到 659 个运行时块定义、642 个运行时生成器、1 个主 bundle、5 个工具箱 XML 和 28 个官方示例工程；ESP-NOW 定义、生成器、默认 XML 和示例均可直接读取。
+- Mixly 4 安装可识别 NW.js/HTTP 布局、板卡 `boardType`、WASM 编译器与 Arduino 库清单；插件生成采用 `plugin.json`、`index.xml`、`index.js` 根部入口并通过 `PluginManager` 导入 OPFS。
 - 后续新增的官方脚本和第三方库会在调用时重新扫描；命名、积木粒度、变量断链、孤立块、重叠和图片意图均只返回提示。
 - `Emakefun_tts20` 的完整标准目录以及 `handuan` 的语言包、媒体和 `FieldImage` 模式均被正确识别。
 - `treePath` 回归使用 240 个中文全局变量、480 个节点，自动连接为 1 条声明栈，没有命令行长度问题。
