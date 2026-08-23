@@ -75,6 +75,14 @@ function formatDuration(seconds) {
   return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
 }
 
+function compactProgressText(value) {
+  return String(value || '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(-110);
+}
+
 function progressLine(label, completed, total, detail = '') {
   const width = 24;
   const hasTotal = Number.isFinite(total) && total > 0;
@@ -161,15 +169,19 @@ function runStreaming(command, args, options = {}) {
     const startedAt = Date.now();
     let outputBytes = 0;
     let output = '';
+    let lastMessage = 'waiting for process output';
     let finished = false;
     const update = () => {
       const elapsed = (Date.now() - startedAt) / 1000;
-      progressLine(options.label || path.basename(command), 0, 0, `${elapsed.toFixed(0)}s, output ${formatBytes(outputBytes)}`);
+      progressLine(options.label || path.basename(command), 0, 0, `${elapsed.toFixed(0)}s, output ${formatBytes(outputBytes)}, ${lastMessage}`);
     };
     const timer = setInterval(update, 500);
     const onData = (chunk) => {
       outputBytes += chunk.length;
-      output += chunk.toString();
+      const text = chunk.toString();
+      const messages = text.split(/[\r\n]+/).map(compactProgressText).filter(Boolean);
+      if (messages.length > 0) lastMessage = messages[messages.length - 1];
+      output += text;
       if (output.length > 12000) output = output.slice(-12000);
     };
     child.stdout.on('data', onData);
@@ -274,12 +286,41 @@ async function ensureDshRuntime(installRoot, nodePath) {
     stageProgress('Install progress', 55, `Installing DeepSeek Harness ${DSH_VERSION}`);
     const npmCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
     const npmRegistry = process.env.MIXLY_NPM_REGISTRY || DEFAULT_NPM_REGISTRY;
-    process.stdout.write(`npm registry: ${npmRegistry}\n`);
-    await runStreaming(nodePath, [npmCli, 'install', '--omit=dev', '--no-audit', '--no-fund', '--progress=false', '--registry', npmRegistry], {
-      cwd: appRoot,
-      label: 'Harness npm install',
-      env: { ...process.env, PATH: `${path.dirname(nodePath)};${process.env.PATH || ''}` }
-    });
+    const registries = [npmRegistry];
+    if (npmRegistry === DEFAULT_NPM_REGISTRY) registries.push('https://registry.npmjs.org');
+    let lastError;
+    for (const [index, registry] of registries.entries()) {
+      process.stdout.write(`npm registry: ${registry} (attempt ${index + 1}/${registries.length})\n`);
+      try {
+        await runStreaming(nodePath, [
+          npmCli,
+          'install',
+          '--omit=dev',
+          '--no-audit',
+          '--no-fund',
+          '--progress=false',
+          '--loglevel=verbose',
+          '--fetch-timeout=20000',
+          '--fetch-retries=1',
+          '--replace-registry-host=always',
+          '--registry',
+          registry
+        ], {
+          cwd: appRoot,
+          label: 'Harness npm install',
+          env: { ...process.env, PATH: `${path.dirname(nodePath)};${process.env.PATH || ''}` }
+        });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (index < registries.length - 1) {
+          finishProgress();
+          process.stdout.write(`npm registry failed; trying official registry. ${error.message}\n`);
+        }
+      }
+    }
+    if (lastError) throw lastError;
     stageProgress('Install progress', 95, 'Harness packages installed; verifying');
   } else {
     stageProgress('Install progress', 95, 'DeepSeek Harness already installed; verifying');
