@@ -8,13 +8,13 @@ set "MCP_SOURCE=%~dp0."
 set "DEFAULT_MIXLY4=%~dp0.."
 if not exist "%DEFAULT_MIXLY4%\boards\index.html" set "DEFAULT_MIXLY4="
 
+set "NODE_CMD="
 where node >nul 2>nul
-if errorlevel 1 (
-  echo Node.js 18 or newer is required to run the installer.
-  echo Install Node.js from https://nodejs.org/ and run this file again.
-  pause
-  exit /b 2
-)
+if not errorlevel 1 set "NODE_CMD=node"
+if not defined NODE_CMD if exist "%LOCALAPPDATA%\MixlyHarness\runtime\node\node.exe" set "NODE_CMD=%LOCALAPPDATA%\MixlyHarness\runtime\node\node.exe"
+if not defined NODE_CMD goto no_node
+"%NODE_CMD%" -e "const major=Number(process.versions.node.split('.')[0]);process.exit(major>=18?0:1)" >nul 2>nul
+if errorlevel 1 goto no_node
 
 echo Mixly 4 AI installer
 if defined DEFAULT_MIXLY4 (
@@ -38,7 +38,7 @@ if not exist "%MIXLY4_HOME%\boards\index.html" (
 )
 
 echo Installing portable Node.js and DeepSeek Harness. Network access may be required.
-node "%MCP_SOURCE%\harness_integration\install.js" --mcp-source "%MCP_SOURCE%" --mixly4-home "%MIXLY4_HOME%"
+"%NODE_CMD%" "%MCP_SOURCE%\harness_integration\install.js" --mcp-source "%MCP_SOURCE%" --mixly4-home "%MIXLY4_HOME%"
 if errorlevel 1 (
   echo Installation failed. Review the error above and run this file again after fixing it.
   pause
@@ -50,3 +50,9 @@ echo Mixly 4 installation complete.
 echo Close and reopen Mixly 4 once so the AI toolbar button is loaded.
 pause
 exit /b 0
+
+:no_node
+echo Node.js 18 or newer was not found in PATH or the existing Harness runtime.
+echo Install Node.js from https://nodejs.org/ and run this file again.
+pause
+exit /b 2

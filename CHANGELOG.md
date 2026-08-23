@@ -1,5 +1,15 @@
 # 更新日志
 
+## 2.5.10 - 2026-08-23
+
+- 两个分代安装器现在检查 Node.js 主版本是否至少为 18，并优先复用已有的 `%LOCALAPPDATA%\\MixlyHarness\\runtime\\node\\node.exe`。
+- 缺少系统 Node.js 时不再直接抛出模糊错误，而是明确提示可用的安装方式。
+
+## 2.5.9 - 2026-08-23
+
+- `Install_Mixly23_AI.cmd` 会自动向上扫描安装器目录的父目录，识别常见的 Mixly 2/3 安装位置；识别成功时无需用户填写路径。
+- 只有无法自动识别时才回退到手动输入，并明确要求填写 Mixly 根目录，而不是 `MixlyLocalMCP` 文件夹。
+
 ## 2.5.8 - 2026-08-23
 
 - 将安装入口拆分为 `Install_Mixly4_AI.cmd` 和 `Install_Mixly23_AI.cmd`，Mixly 4 与 Mixly 2/3 不再共用一个交互命令。
