@@ -111,6 +111,9 @@ async function main() {
   const patch = fs.readFileSync(path.join(__dirname, 'config', 'mixly-mcp.cordis.yml'), 'utf8');
   assert(patch.includes("name: '@deepseek-ai/dsh-mcp-client'"));
   assert(patch.includes('MIXLY_MCP_ROUTER'));
+  const installerSource = fs.readFileSync(path.join(__dirname, '..', 'Install_Mixly4_AI.cmd'), 'utf8');
+  assert(installerSource.includes('harness_integration\\install.js'));
+  assert(installerSource.includes('--mixly4-home'));
   const tools = await listCompactTools();
   assert.equal(tools.length, 9);
   assert(tools.includes('mixly_build_project'));

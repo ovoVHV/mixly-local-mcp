@@ -1,4 +1,4 @@
-# Mixly Local MCP 2.5.5
+# Mixly Local MCP 2.5.6
 
 下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
 
@@ -12,6 +12,11 @@
 - 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
 
 以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.5.6 更新说明
+
+- 新增 `Install_Mixly4_AI.cmd` 一键安装入口：自动识别 Mixly 4 根目录，安装便携 Node.js 与 DeepSeek Harness，并给所有板卡页面注入 AI 按钮。
+- 用户不再需要手工拼接 Harness 安装命令；首次安装完成后只需关闭并重新打开 Mixly 4 一次。
 
 ## 2.5.5 更新说明
 
@@ -130,7 +135,7 @@ node harness_integration\install.js `
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.5.5.zip
+Mixly_Local_MCP_v2.5.6.zip
 ```
 
 解压后目录包含：
@@ -143,6 +148,7 @@ MixlyLocalMCP/
   validate_mixly_workspace.js
   mixly_mcp_call.js
   Mixly4_MCP_Server.cmd
+  Install_Mixly4_AI.cmd
   harness_integration/
   package.json
   package-lock.json
@@ -156,6 +162,15 @@ MixlyLocalMCP/
 - 一份本机 Mixly 2.x、Mixly 3.x 或 Mixly 4.x
 - 支持本地 STDIO MCP 的 AI 客户端
 - 需要编译 C/C++ 时，本机存在可用的 `arduino-cli`
+
+### Mixly 4 一键安装
+
+1. 下载 `Mixly_Local_MCP_v2.5.6.zip`，解压到 Mixly 4 安装目录；解压后应看到 `MixlyLocalMCP` 文件夹。
+2. 打开 `MixlyLocalMCP\Install_Mixly4_AI.cmd`。如果它没有自动识别路径，输入 Mixly 4 根目录，例如 `E:\mixly4_win-x86\mixly4_win`。
+3. 安装器会下载并保存便携 Node.js、安装 DeepSeek Harness，把 MCP 和 Mixly 4 AI 按钮写入 `%LOCALAPPDATA%\\MixlyHarness` 及 Mixly 4 的 `boards\\index.html`。
+4. 安装完成后关闭并重新打开 Mixly 4 一次，让页面加载 AI 按钮；之后点击顶栏的闪光按钮即可打开 Harness。
+
+这次“重新打开 Mixly 4”只发生在首次安装或更新适配器时，不会在 Harness 正在执行任务时因为 CDP 端口变化而重启任务。同一 Mixly 安装重复点击按钮会复用当前会话。
 
 ## Mixly 根目录
 
@@ -533,7 +548,7 @@ node tools\test_mixly_local_mcp_package.js
 问题标题建议使用：
 
 ```text
-[MCP 2.5.5][板卡 id@型号] 简短现象
+[MCP 2.5.6][板卡 id@型号] 简短现象
 ```
 
 问题正文至少包含：
@@ -551,7 +566,7 @@ node tools\test_mixly_local_mcp_package.js
 
 - 动态发现 21 个板卡入口，包含默认板卡和 `boards/extend` 扩展板。
 - 发现本机 AVR、ESP32 和 ESP8266 Arduino cores。
-- MCP 2.5.5 协议共 19 个工具；Harness 精简模式公开 9 个工作流工具 schema。AVR 完整模式扫描到 529 个官方类型，多能力扫描和契约可在一次调用中返回。
+- MCP 2.5.6 协议共 19 个工具；Harness 精简模式公开 9 个工作流工具 schema。AVR 完整模式扫描到 529 个官方类型，多能力扫描和契约可在一次调用中返回。
 - Mixly 3 ESP32 源码树扫描到 659 个运行时块定义、642 个运行时生成器、1 个主 bundle、5 个工具箱 XML 和 28 个官方示例工程；ESP-NOW 定义、生成器、默认 XML 和示例均可直接读取。
 - Mixly 4 安装可识别 NW.js/HTTP 布局、板卡 `boardType`、WASM 编译器与 Arduino 库清单；插件生成采用 `plugin.json`、`index.xml`、`index.js` 根部入口并通过 `PluginManager` 导入 OPFS。
 - 后续新增的官方脚本和第三方库会在调用时重新扫描；命名、积木粒度、变量断链、孤立块、重叠和图片意图均只返回提示。
