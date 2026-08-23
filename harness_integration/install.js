@@ -170,14 +170,24 @@ function runStreaming(command, args, options = {}) {
     let outputBytes = 0;
     let output = '';
     let lastMessage = 'waiting for process output';
+    let lastOutputAt = Date.now();
     let finished = false;
+    const idleTimeoutMs = options.idleTimeoutMs || 0;
     const update = () => {
       const elapsed = (Date.now() - startedAt) / 1000;
       progressLine(options.label || path.basename(command), 0, 0, `${elapsed.toFixed(0)}s, output ${formatBytes(outputBytes)}, ${lastMessage}`);
+      if (!finished && idleTimeoutMs > 0 && Date.now() - lastOutputAt >= idleTimeoutMs) {
+        child.kill();
+        finished = true;
+        clearInterval(timer);
+        finishProgress();
+        reject(new Error(`${options.label || path.basename(command)} produced no output for ${Math.round(idleTimeoutMs / 1000)} seconds`));
+      }
     };
     const timer = setInterval(update, 500);
     const onData = (chunk) => {
       outputBytes += chunk.length;
+      lastOutputAt = Date.now();
       const text = chunk.toString();
       const messages = text.split(/[\r\n]+/).map(compactProgressText).filter(Boolean);
       if (messages.length > 0) lastMessage = messages[messages.length - 1];
@@ -282,6 +292,21 @@ async function ensureDshRuntime(installRoot, nodePath) {
     dependencies: { '@deepseek-ai/dsh': DSH_VERSION }
   }, null, 2)}\n`, 'utf8');
 
+  const bundledLockPath = path.join(__dirname, 'dsh-package-lock.json');
+  const lockPath = path.join(appRoot, 'package-lock.json');
+  if (fs.existsSync(bundledLockPath)) {
+    let needsLock = !fs.existsSync(lockPath);
+    if (!needsLock) {
+      try {
+        const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+        needsLock = !lock.packages || !lock.packages['node_modules/@deepseek-ai/dsh'];
+      } catch {
+        needsLock = true;
+      }
+    }
+    if (needsLock) copyFile(bundledLockPath, lockPath);
+  }
+
   if (!fs.existsSync(cliPath)) {
     stageProgress('Install progress', 55, `Installing DeepSeek Harness ${DSH_VERSION}`);
     const npmCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
@@ -302,12 +327,15 @@ async function ensureDshRuntime(installRoot, nodePath) {
           '--loglevel=verbose',
           '--fetch-timeout=20000',
           '--fetch-retries=1',
+          '--legacy-peer-deps',
+          '--prefer-offline',
           '--replace-registry-host=always',
           '--registry',
           registry
         ], {
           cwd: appRoot,
           label: 'Harness npm install',
+          idleTimeoutMs: 180000,
           env: { ...process.env, PATH: `${path.dirname(nodePath)};${process.env.PATH || ''}` }
         });
         lastError = null;

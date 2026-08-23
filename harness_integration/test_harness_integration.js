@@ -128,6 +128,9 @@ async function main() {
   assert(installerRuntimeSource.includes('npmmirror.com/mirrors/node'));
   assert(installerRuntimeSource.includes('MIXLY_NPM_REGISTRY'));
   assert(installerRuntimeSource.includes('--fetch-timeout=20000'));
+  assert(installerRuntimeSource.includes('--legacy-peer-deps'));
+  assert(installerRuntimeSource.includes('dsh-package-lock.json'));
+  assert(installerRuntimeSource.includes('idleTimeoutMs: 180000'));
   assert(installerRuntimeSource.includes('replace-registry-host=always'));
   const tools = await listCompactTools();
   assert.equal(tools.length, 9);
