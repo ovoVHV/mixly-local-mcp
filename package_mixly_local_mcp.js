@@ -17,7 +17,7 @@ const sources = [
   { source: path.join(toolsDir, 'validate_mixly_workspace.js'), archive: 'validate_mixly_workspace.js' },
   { source: path.join(toolsDir, 'mixly_mcp_call.js'), archive: 'mixly_mcp_call.js' },
   { source: path.join(toolsDir, 'Mixly4_MCP_Server.cmd'), archive: 'Mixly4_MCP_Server.cmd' },
-  { source: path.join(toolsDir, 'Install_Mixly_AI.cmd'), archive: 'Install_Mixly_AI.cmd' },
+  { source: path.join(toolsDir, 'Install_Mixly23_AI.cmd'), archive: 'Install_Mixly23_AI.cmd' },
   { source: path.join(toolsDir, 'Install_Mixly4_AI.cmd'), archive: 'Install_Mixly4_AI.cmd' },
   { source: path.join(toolsDir, 'package.json'), archive: 'package.json' },
   { source: path.join(toolsDir, 'package-lock.json'), archive: 'package-lock.json' },

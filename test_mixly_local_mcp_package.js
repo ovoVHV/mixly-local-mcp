@@ -121,7 +121,7 @@ async function main() {
     assert(entries.includes('MixlyLocalMCP/test_mixly_code_equivalence.js'));
     assert(entries.includes('MixlyLocalMCP/Mixly4_MCP_Server.cmd'));
     assert(entries.includes('MixlyLocalMCP/Install_Mixly4_AI.cmd'));
-    assert(entries.includes('MixlyLocalMCP/Install_Mixly_AI.cmd'));
+    assert(entries.includes('MixlyLocalMCP/Install_Mixly23_AI.cmd'));
     assert(entries.includes('MixlyLocalMCP/harness_integration/install.js'));
     assert(entries.includes('MixlyLocalMCP/harness_integration/launcher.js'));
     assert(entries.includes('MixlyLocalMCP/harness_integration/mcp_router.js'));
