@@ -9,10 +9,15 @@ set "MCP_SOURCE=%~dp0."
 set "NODE_CMD="
 where node >nul 2>nul
 if not errorlevel 1 set "NODE_CMD=node"
+if defined NODE_CMD (
+  "%NODE_CMD%" -e "const major=Number(process.versions.node.split('.')[0]);process.exit(major>=18?0:1)" >nul 2>nul
+  if errorlevel 1 set "NODE_CMD="
+)
 if not defined NODE_CMD if exist "%LOCALAPPDATA%\MixlyHarness\runtime\node\node.exe" set "NODE_CMD=%LOCALAPPDATA%\MixlyHarness\runtime\node\node.exe"
-if not defined NODE_CMD goto no_node
-"%NODE_CMD%" -e "const major=Number(process.versions.node.split('.')[0]);process.exit(major>=18?0:1)" >nul 2>nul
-if errorlevel 1 goto no_node
+if defined NODE_CMD (
+  "%NODE_CMD%" -e "const major=Number(process.versions.node.split('.')[0]);process.exit(major>=18?0:1)" >nul 2>nul
+  if errorlevel 1 set "NODE_CMD="
+)
 
 echo Mixly 2 / 3 AI installer
 echo Scanning the installer folder and its parent folders for Mixly installations...
@@ -36,9 +41,9 @@ if not defined MIXLY2_HOME if not defined MIXLY3_HOME (
 )
 
 if not defined MIXLY2_HOME if not defined MIXLY3_HOME (
-  echo At least one Mixly 2 or Mixly 3 path is required.
+  echo No Mixly 2 or Mixly 3 path was selected. Skipping this installer.
   pause
-  exit /b 2
+  exit /b 0
 )
 
 set "MIXLY2_ARG="
@@ -64,6 +69,7 @@ if defined MIXLY3_HOME (
   set MIXLY3_ARG=--mixly3-home "%MIXLY3_HOME%"
 )
 
+if not defined NODE_CMD goto no_node
 echo Installing portable Node.js and DeepSeek Harness. Network access may be required.
 "%NODE_CMD%" "%MCP_SOURCE%\harness_integration\install.js" --mcp-source "%MCP_SOURCE%" %MIXLY2_ARG% %MIXLY3_ARG%
 if errorlevel 1 (

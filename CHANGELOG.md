@@ -1,5 +1,17 @@
 # 更新日志
 
+## 2.5.12 - 2026-08-23
+
+- Node.js 运行时下载默认优先使用 npmmirror 国内镜像，失败时自动回退官方源。
+- DeepSeek Harness 的 npm 安装默认使用 npmmirror registry；可用 `MIXLY_NPM_REGISTRY` 覆盖。
+
+## 2.5.11 - 2026-08-23
+
+- 2/3 代安装器的空路径会直接跳过；两代路径都为空时以成功状态结束，不再把“未选择安装目标”当成错误。
+- Mixly 4 安装器的空路径也会直接跳过；未选择目标时不会先检查 Node.js 或联网。
+- Node.js 下载显示真实百分比、速度和预计剩余时间；解压、Harness 安装和校验显示统一阶段百分比。
+- Harness 的 npm 安装改为可见的实时状态，显示耗时和输出量，避免 npm spinner 看起来像卡住。
+
 ## 2.5.10 - 2026-08-23
 
 - 两个分代安装器现在检查 Node.js 主版本是否至少为 18，并优先复用已有的 `%LOCALAPPDATA%\\MixlyHarness\\runtime\\node\\node.exe`。

@@ -120,6 +120,13 @@ async function main() {
   assert(legacyInstallerSource.includes('--mixly2-home'));
   assert(legacyInstallerSource.includes('--mixly3-home'));
   assert(legacyInstallerSource.includes('process.versions.node'));
+  assert(legacyInstallerSource.includes('No Mixly 2 or Mixly 3 path was selected'));
+  const installerRuntimeSource = fs.readFileSync(path.join(__dirname, 'install.js'), 'utf8');
+  assert(installerRuntimeSource.includes("content-length"));
+  assert(installerRuntimeSource.includes('runStreaming'));
+  assert(installerRuntimeSource.includes("--progress=false"));
+  assert(installerRuntimeSource.includes('npmmirror.com/mirrors/node'));
+  assert(installerRuntimeSource.includes('MIXLY_NPM_REGISTRY'));
   const tools = await listCompactTools();
   assert.equal(tools.length, 9);
   assert(tools.includes('mixly_build_project'));

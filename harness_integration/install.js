@@ -3,12 +3,16 @@
 const fs = require('node:fs');
 const https = require('node:https');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const NODE_VERSION = '24.19.0';
 const DSH_VERSION = '0.1.0-rc.6';
 const NODE_ARCHIVE = `node-v${NODE_VERSION}-win-x64.zip`;
-const NODE_URL = `https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}`;
+const NODE_URLS = [
+  `https://npmmirror.com/mirrors/node/v${NODE_VERSION}/${NODE_ARCHIVE}`,
+  `https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}`
+];
+const DEFAULT_NPM_REGISTRY = 'https://registry.npmmirror.com';
 
 function parseArgs(argv) {
   const options = { mixly2: [], mixly3: [], mixly4: [] };
@@ -53,28 +57,137 @@ function copyTree(source, destination) {
   }
 }
 
-function download(url, destination) {
+let progressLength = 0;
+
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value < 0) return '? B';
+  if (value < 1024) return `${value.toFixed(0)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--:--';
+  const rounded = Math.ceil(seconds);
+  const minutes = Math.floor(rounded / 60);
+  const remainder = rounded % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+}
+
+function progressLine(label, completed, total, detail = '') {
+  const width = 24;
+  const hasTotal = Number.isFinite(total) && total > 0;
+  const ratio = hasTotal ? Math.max(0, Math.min(1, completed / total)) : 0;
+  const percent = hasTotal ? `${(ratio * 100).toFixed(1).padStart(5)}%` : ' --.-%';
+  const filled = hasTotal ? Math.round(width * ratio) : 0;
+  const bar = `${'='.repeat(filled)}${hasTotal && filled < width ? '>' : ''}${' '.repeat(Math.max(0, width - filled - (hasTotal && filled < width ? 1 : 0)))}`;
+  const line = `${label} [${bar}] ${percent}${detail ? ` ${detail}` : ''}`;
+  process.stdout.write(`\r${line}${' '.repeat(Math.max(0, progressLength - line.length))}`);
+  progressLength = line.length;
+}
+
+function finishProgress() {
+  if (progressLength > 0) process.stdout.write('\n');
+  progressLength = 0;
+}
+
+function stageProgress(label, percent, detail = '') {
+  finishProgress();
+  process.stdout.write(`${label} [${String(percent).padStart(3)}%]${detail ? ` ${detail}` : ''}\n`);
+}
+
+function download(url, destination, label = 'Downloading') {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destination), { recursive: true });
-    const output = fs.createWriteStream(destination);
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      finishProgress();
+      fs.rmSync(destination, { force: true });
+      reject(error);
+    };
     const request = https.get(url, (response) => {
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        output.close();
-        fs.rmSync(destination, { force: true });
-        download(new URL(response.headers.location, url).toString(), destination).then(resolve, reject);
+        response.resume();
+        download(new URL(response.headers.location, url).toString(), destination, label).then(resolve, reject);
         return;
       }
       if (response.statusCode !== 200) {
-        output.close();
-        reject(new Error(`Download failed (${response.statusCode}): ${url}`));
+        response.resume();
+        fail(new Error(`Download failed (${response.statusCode}): ${url}`));
         return;
       }
+
+      const total = Number(response.headers['content-length'] || 0);
+      let downloaded = 0;
+      let lastUpdate = 0;
+      const startedAt = Date.now();
+      const output = fs.createWriteStream(destination);
+      response.on('data', (chunk) => {
+        downloaded += chunk.length;
+        const now = Date.now();
+        if (now - lastUpdate < 100 && downloaded !== total) return;
+        lastUpdate = now;
+        const elapsed = Math.max(0.001, (now - startedAt) / 1000);
+        const speed = downloaded / elapsed;
+        const eta = total > 0 && speed > 0 ? `ETA ${formatDuration((total - downloaded) / speed)}` : '';
+        progressLine(label, downloaded, total, `${formatBytes(downloaded)} / ${total > 0 ? formatBytes(total) : '?'} at ${formatBytes(speed)}/s${eta ? ` ${eta}` : ''}`);
+      });
+      response.on('error', fail);
+      output.on('error', fail);
+      output.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        progressLine(label, total || downloaded, total || downloaded, `${formatBytes(downloaded)} complete`);
+        finishProgress();
+        output.close(resolve);
+      });
       response.pipe(output);
-      output.on('finish', () => output.close(resolve));
     });
-    request.on('error', (error) => {
-      output.close();
+    request.on('error', fail);
+  });
+}
+
+function runStreaming(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env || process.env,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const startedAt = Date.now();
+    let outputBytes = 0;
+    let output = '';
+    let finished = false;
+    const update = () => {
+      const elapsed = (Date.now() - startedAt) / 1000;
+      progressLine(options.label || path.basename(command), 0, 0, `${elapsed.toFixed(0)}s, output ${formatBytes(outputBytes)}`);
+    };
+    const timer = setInterval(update, 500);
+    const onData = (chunk) => {
+      outputBytes += chunk.length;
+      output += chunk.toString();
+      if (output.length > 12000) output = output.slice(-12000);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('error', (error) => {
+      if (finished) return;
+      finished = true;
+      clearInterval(timer);
+      finishProgress();
       reject(error);
+    });
+    child.on('close', (code) => {
+      if (finished) return;
+      finished = true;
+      clearInterval(timer);
+      finishProgress();
+      if (code !== 0) reject(new Error(`${path.basename(command)} failed (${code})\n${output}`));
+      else resolve(output);
     });
   });
 }
@@ -100,7 +213,10 @@ async function ensureNodeRuntime(installRoot) {
   const nodePath = path.join(nodeRoot, 'node.exe');
   if (fs.existsSync(nodePath)) {
     const version = run(nodePath, ['--version'], { capture: true }).trim();
-    if (version === `v${NODE_VERSION}`) return nodePath;
+    if (version === `v${NODE_VERSION}`) {
+      stageProgress('Install progress', 50, `Node.js ${version} already available`);
+      return nodePath;
+    }
     const backup = path.join(runtimeRoot, `node-backup-${Date.now()}`);
     fs.renameSync(nodeRoot, backup);
   }
@@ -108,11 +224,29 @@ async function ensureNodeRuntime(installRoot) {
   const downloads = path.join(installRoot, 'downloads');
   const archivePath = path.join(downloads, NODE_ARCHIVE);
   if (!fs.existsSync(archivePath)) {
-    process.stdout.write(`Downloading Node.js v${NODE_VERSION} x64...\n`);
-    await download(NODE_URL, archivePath);
+    stageProgress('Install progress', 5, `Downloading Node.js v${NODE_VERSION} x64`);
+    let lastError;
+    for (const [index, url] of NODE_URLS.entries()) {
+      try {
+        process.stdout.write(`Node.js source: ${new URL(url).host}${index === 0 ? ' (China mirror)' : ' (official fallback)'}\n`);
+        await download(url, archivePath, 'Node.js download');
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        finishProgress();
+        if (index < NODE_URLS.length - 1) {
+          process.stdout.write(`Mirror download failed; trying official Node.js source. ${error.message}\n`);
+        }
+      }
+    }
+    if (lastError) throw lastError;
+  } else {
+    stageProgress('Install progress', 35, 'Node.js archive already downloaded');
   }
   const extractRoot = path.join(runtimeRoot, `node-extract-${process.pid}`);
   fs.mkdirSync(extractRoot, { recursive: true });
+  stageProgress('Install progress', 40, 'Extracting Node.js');
   run('tar.exe', ['-xf', archivePath, '-C', extractRoot]);
   const extracted = path.join(extractRoot, `node-v${NODE_VERSION}-win-x64`);
   if (!fs.existsSync(path.join(extracted, 'node.exe'))) {
@@ -120,10 +254,11 @@ async function ensureNodeRuntime(installRoot) {
   }
   fs.renameSync(extracted, nodeRoot);
   fs.rmSync(extractRoot, { recursive: true, force: true });
+  stageProgress('Install progress', 50, `Node.js v${NODE_VERSION} ready`);
   return nodePath;
 }
 
-function ensureDshRuntime(installRoot, nodePath) {
+async function ensureDshRuntime(installRoot, nodePath) {
   const appRoot = path.join(installRoot, 'runtime', 'dsh-app');
   const packagePath = path.join(appRoot, 'package.json');
   const cliPath = path.join(appRoot, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
@@ -136,14 +271,21 @@ function ensureDshRuntime(installRoot, nodePath) {
   }, null, 2)}\n`, 'utf8');
 
   if (!fs.existsSync(cliPath)) {
-    process.stdout.write(`Installing DeepSeek Harness ${DSH_VERSION}...\n`);
+    stageProgress('Install progress', 55, `Installing DeepSeek Harness ${DSH_VERSION}`);
     const npmCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-    run(nodePath, [npmCli, 'install', '--omit=dev', '--no-audit', '--no-fund'], {
+    const npmRegistry = process.env.MIXLY_NPM_REGISTRY || DEFAULT_NPM_REGISTRY;
+    process.stdout.write(`npm registry: ${npmRegistry}\n`);
+    await runStreaming(nodePath, [npmCli, 'install', '--omit=dev', '--no-audit', '--no-fund', '--progress=false', '--registry', npmRegistry], {
       cwd: appRoot,
+      label: 'Harness npm install',
       env: { ...process.env, PATH: `${path.dirname(nodePath)};${process.env.PATH || ''}` }
     });
+    stageProgress('Install progress', 95, 'Harness packages installed; verifying');
+  } else {
+    stageProgress('Install progress', 95, 'DeepSeek Harness already installed; verifying');
   }
   run(nodePath, [cliPath, '--version'], { cwd: appRoot, capture: true });
+  stageProgress('Install progress', 100, `DeepSeek Harness ${DSH_VERSION} ready`);
   return cliPath;
 }
 
@@ -229,7 +371,7 @@ async function main() {
   );
   if (!options.skipRuntime) {
     nodePath = await ensureNodeRuntime(installRoot);
-    dshCli = ensureDshRuntime(installRoot, nodePath);
+    dshCli = await ensureDshRuntime(installRoot, nodePath);
   } else if (!fs.existsSync(dshCli)) {
     dshCli = null;
   }
@@ -264,4 +406,11 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, patchBoardsHtml, stageMixly4Plugin };
+module.exports = {
+  download,
+  formatBytes,
+  formatDuration,
+  parseArgs,
+  patchBoardsHtml,
+  stageMixly4Plugin
+};

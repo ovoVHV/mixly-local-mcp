@@ -1,4 +1,4 @@
-# Mixly Local MCP 2.5.10
+# Mixly Local MCP 2.5.12
 
 下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
 
@@ -12,6 +12,18 @@
 - 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
 
 以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.5.12 更新说明
+
+- Node.js 下载默认优先使用 npmmirror 国内镜像，镜像失败会自动回退到官方源。
+- Harness npm 依赖默认使用 `https://registry.npmmirror.com`；设置 `MIXLY_NPM_REGISTRY` 可切换到公司或本地 registry。
+
+## 2.5.11 更新说明
+
+- 安装器显示 Node.js 下载百分比、速度和 ETA，并显示解压、Harness npm 安装、校验等阶段百分比。
+- Harness npm 安装显示实时耗时和输出量；npm 本身没有可靠的总包数，因此该阶段使用明确的阶段进度而不是伪造包百分比。
+- Mixly 2/3 安装器中空路径会跳过；两项都为空时直接成功退出，不再报“至少需要一个路径”。
+- Mixly 4 安装器留空路径也会直接跳过，并且不会为了空安装目标先检查 Node.js 或联网。
 
 ## 2.5.10 更新说明
 
@@ -155,7 +167,7 @@ node harness_integration\install.js `
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.5.10.zip
+Mixly_Local_MCP_v2.5.12.zip
 ```
 
 解压后目录包含：
@@ -186,7 +198,7 @@ MixlyLocalMCP/
 
 ### 分代一键安装
 
-1. 下载 `Mixly_Local_MCP_v2.5.10.zip` 并解压到任意目录。
+1. 下载 `Mixly_Local_MCP_v2.5.12.zip` 并解压到任意目录。
 2. Mixly 4 用户双击 `MixlyLocalMCP\Install_Mixly4_AI.cmd`。
 3. Mixly 2/3 用户双击 `MixlyLocalMCP\Install_Mixly23_AI.cmd`。安装器会自动扫描父目录；只有扫描不到时才要求填写 Mixly 2/3 根目录。
 4. 安装器会下载并保存便携 Node.js、安装 DeepSeek Harness，把 MCP 和对应代际的 AI 按钮写入 `%LOCALAPPDATA%\\MixlyHarness` 以及各自的板卡页面。
