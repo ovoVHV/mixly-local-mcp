@@ -13,10 +13,12 @@ This integration adds one AI toolbar button to Mixly and starts the official Dee
 
 ## Local install
 
-For end users, extract the release ZIP into the Mixly 4 directory and double-click
-`MixlyLocalMCP/Install_Mixly4_AI.cmd`. It detects the parent Mixly 4 root, installs
-the portable runtime, and patches the shared board page. Close and reopen Mixly 4
-once after installation so the toolbar adapter is loaded.
+For end users, extract the release ZIP anywhere and double-click
+`MixlyLocalMCP/Install_Mixly_AI.cmd`. It accepts optional Mixly 2, Mixly 3 and
+Mixly 4 roots, installs the portable runtime, and patches each selected board
+page. `Install_Mixly4_AI.cmd` remains as a compatibility wrapper. Close and
+reopen each selected Mixly application once after installation so its toolbar
+adapter is loaded.
 
 ```powershell
 node install.js `

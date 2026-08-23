@@ -1,5 +1,10 @@
 # 更新日志
 
+## 2.5.7 - 2026-08-23
+
+- 通用一键安装器现在同时支持 Mixly 2、Mixly 3 和 Mixly 4；用户可填写任意代际路径，留空即可跳过。
+- `Install_Mixly4_AI.cmd` 保留为旧入口并自动转发到通用安装器。
+
 ## 2.5.6 - 2026-08-23
 
 - 新增 `Install_Mixly4_AI.cmd` 一键安装入口：自动识别 Mixly 4 根目录，安装便携 Node.js 与 DeepSeek Harness，并注入全板卡 AI 按钮。

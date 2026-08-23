@@ -1,4 +1,4 @@
-# Mixly Local MCP 2.5.6
+# Mixly Local MCP 2.5.7
 
 下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
 
@@ -12,6 +12,11 @@
 - 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
 
 以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.5.7 更新说明
+
+- 一键安装器现在同时支持 Mixly 2、Mixly 3 和 Mixly 4；可填写一个或多个本机安装路径，留空即可跳过。
+- `Install_Mixly4_AI.cmd` 保留为兼容旧入口，实际转发到 `Install_Mixly_AI.cmd`。
 
 ## 2.5.6 更新说明
 
@@ -135,7 +140,7 @@ node harness_integration\install.js `
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.5.6.zip
+Mixly_Local_MCP_v2.5.7.zip
 ```
 
 解压后目录包含：
@@ -148,6 +153,7 @@ MixlyLocalMCP/
   validate_mixly_workspace.js
   mixly_mcp_call.js
   Mixly4_MCP_Server.cmd
+  Install_Mixly_AI.cmd
   Install_Mixly4_AI.cmd
   harness_integration/
   package.json
@@ -163,12 +169,12 @@ MixlyLocalMCP/
 - 支持本地 STDIO MCP 的 AI 客户端
 - 需要编译 C/C++ 时，本机存在可用的 `arduino-cli`
 
-### Mixly 4 一键安装
+### Mixly 2/3/4 一键安装
 
-1. 下载 `Mixly_Local_MCP_v2.5.6.zip`，解压到 Mixly 4 安装目录；解压后应看到 `MixlyLocalMCP` 文件夹。
-2. 打开 `MixlyLocalMCP\Install_Mixly4_AI.cmd`。如果它没有自动识别路径，输入 Mixly 4 根目录，例如 `E:\mixly4_win-x86\mixly4_win`。
-3. 安装器会下载并保存便携 Node.js、安装 DeepSeek Harness，把 MCP 和 Mixly 4 AI 按钮写入 `%LOCALAPPDATA%\\MixlyHarness` 及 Mixly 4 的 `boards\\index.html`。
-4. 安装完成后关闭并重新打开 Mixly 4 一次，让页面加载 AI 按钮；之后点击顶栏的闪光按钮即可打开 Harness。
+1. 下载 `Mixly_Local_MCP_v2.5.7.zip`，解压到任意目录；如果放在 Mixly 4 根目录下，安装器会自动识别 Mixly 4。
+2. 打开 `MixlyLocalMCP\Install_Mixly_AI.cmd`。依次填写 Mixly 4、Mixly 2、Mixly 3 的完整路径，不使用的版本直接回车跳过。
+3. 安装器会下载并保存便携 Node.js、安装 DeepSeek Harness，把 MCP 和对应代际的 AI 按钮写入 `%LOCALAPPDATA%\\MixlyHarness` 以及各自的板卡页面。
+4. 安装完成后关闭并重新打开已选择的 Mixly 应用一次，让页面加载 AI 按钮；之后点击顶栏的闪光按钮即可打开 Harness。
 
 这次“重新打开 Mixly 4”只发生在首次安装或更新适配器时，不会在 Harness 正在执行任务时因为 CDP 端口变化而重启任务。同一 Mixly 安装重复点击按钮会复用当前会话。
 
