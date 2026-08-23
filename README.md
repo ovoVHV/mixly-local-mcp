@@ -1,4 +1,4 @@
-# Mixly Local MCP 2.5.4
+# Mixly Local MCP 2.5.5
 
 下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
 
@@ -12,6 +12,12 @@
 - 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
 
 以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.5.5 更新说明
+
+- 修复 Mixly 4 内置 AI 在同一安装目录的 CDP 端口变化时重启整个 Harness，避免允许重启后正在执行的任务被终止。
+- 同一 Mixly 安装现在保持现有 Harness 会话和 MCP 上下文；只有切换 Mixly 代际或安装目录才会重启。
+- 适配器在复用会话时会明确提示未重启任务。
 
 ## 2.5.4 更新说明
 
@@ -35,7 +41,7 @@
 ## 2.5.1 更新说明
 
 - 修复 Harness 会话串代：MCP 上下文在进程启动时锁定，运行中修改活动环境文件不会把 Mixly 4 任务静默切到 Mixly 2。
-- 同一 Mixly 重复打开会复用现有进程；切换 2/3/4 或安装目录时会完整重启 Harness，并在侧栏标题显示当前锁定代际。
+- 同一 Mixly 重复打开会复用现有进程；CDP 端口变化也不会重启当前任务。只有切换 2/3/4 或安装目录时会完整重启 Harness，并在侧栏标题显示当前锁定代际。
 - Harness 工作目录直接绑定当前 Mixly 根目录；API 配置和聊天数据继续保留，MCP 子进程则固定在启动时选中的代际。
 - 按钮只接受真实用户点击，防止后台页面用脚本触发后抢占当前环境。
 - MCP 工具默认继承 Harness 锁定的 Mixly 4 CDP 端口，AI 无需每次填写 `cdpPort`，不会把实际 `9347` 错查成 `9333`。
@@ -124,7 +130,7 @@ node harness_integration\install.js `
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.5.4.zip
+Mixly_Local_MCP_v2.5.5.zip
 ```
 
 解压后目录包含：
@@ -527,7 +533,7 @@ node tools\test_mixly_local_mcp_package.js
 问题标题建议使用：
 
 ```text
-[MCP 2.5.4][板卡 id@型号] 简短现象
+[MCP 2.5.5][板卡 id@型号] 简短现象
 ```
 
 问题正文至少包含：
@@ -545,7 +551,7 @@ node tools\test_mixly_local_mcp_package.js
 
 - 动态发现 21 个板卡入口，包含默认板卡和 `boards/extend` 扩展板。
 - 发现本机 AVR、ESP32 和 ESP8266 Arduino cores。
-- MCP 2.5.4 协议共 19 个工具；Harness 精简模式公开 9 个工作流工具 schema。AVR 完整模式扫描到 529 个官方类型，多能力扫描和契约可在一次调用中返回。
+- MCP 2.5.5 协议共 19 个工具；Harness 精简模式公开 9 个工作流工具 schema。AVR 完整模式扫描到 529 个官方类型，多能力扫描和契约可在一次调用中返回。
 - Mixly 3 ESP32 源码树扫描到 659 个运行时块定义、642 个运行时生成器、1 个主 bundle、5 个工具箱 XML 和 28 个官方示例工程；ESP-NOW 定义、生成器、默认 XML 和示例均可直接读取。
 - Mixly 4 安装可识别 NW.js/HTTP 布局、板卡 `boardType`、WASM 编译器与 Arduino 库清单；插件生成采用 `plugin.json`、`index.xml`、`index.js` 根部入口并通过 `PluginManager` 导入 OPFS。
 - 后续新增的官方脚本和第三方库会在调用时重新扫描；命名、积木粒度、变量断链、孤立块、重叠和图片意图均只返回提示。

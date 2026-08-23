@@ -292,7 +292,10 @@
       if (!result.ok) throw new Error(result.message || 'DeepSeek Harness 启动失败');
       setState(button, 'ready', '打开 Mixly AI');
       openHarness(result.url, result.activeContext);
-      if (result.restarted) notify(`已切换并锁定 Mixly ${result.activeContext.generation} 环境`);
+      if (result.contextRefreshSkipped) {
+        notify(`已复用当前 Mixly ${result.activeContext.generation} AI 会话，未重启任务`);
+      }
+      else if (result.restarted) notify(`已切换并锁定 Mixly ${result.activeContext.generation} 环境`);
       else notify(result.reused ? `Mixly ${result.activeContext.generation} AI 已打开` : 'Mixly AI 启动成功');
     } catch (error) {
       setState(button, 'error', `Mixly AI 启动失败：${error.message || error}`);

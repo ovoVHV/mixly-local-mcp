@@ -68,6 +68,19 @@ function contextKey(context) {
   ].join('|');
 }
 
+// CDP is a transport detail, not a new Harness session. A normal Mixly 4
+// build may expose no CDP while an SDK build uses a different port; changing
+// that value must not kill an active conversation just because the toolbar
+// button was clicked again.
+function stableContextKey(context) {
+  if (!context) return '';
+  return [
+    path.resolve(String(context.mixlyHome || '')).toLowerCase(),
+    String(context.generation || '0'),
+    String(context.origin || '')
+  ].join('|');
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -275,10 +288,22 @@ async function startHarnessUnlocked(options, installRoot, stateDir) {
   const previousHealthy = await reuseRunning(previous);
   if (
     previousHealthy
-    && contextKey(previous.activeContext) === contextKey(activeContext)
-    && contextKey(persistedContext) === contextKey(activeContext)
+    && stableContextKey(previous.activeContext) === stableContextKey(activeContext)
+    && stableContextKey(persistedContext) === stableContextKey(activeContext)
   ) {
-    const result = { ...previous, ok: true, reused: true, restarted: false };
+    const contextRefreshSkipped = contextKey(previous.activeContext) !== contextKey(activeContext);
+    // Keep the context pinned to the running Harness. Updating this file with
+    // a new CDP port would make the next MCP child disagree with the live
+    // conversation, while restarting here would terminate the user's task.
+    const result = {
+      ...previous,
+      ok: true,
+      reused: true,
+      restarted: false,
+      contextRefreshSkipped,
+      requestedContext: contextRefreshSkipped ? activeContext : undefined
+    };
+    if (!contextRefreshSkipped) delete result.requestedContext;
     writeJsonAtomic(statePath, result);
     if (responsePath) writeJsonAtomic(responsePath, result);
     return result;
@@ -403,6 +428,7 @@ if (require.main === module) main();
 module.exports = {
   choosePort,
   contextKey,
+  stableContextKey,
   discoverCdpPort,
   instanceKey,
   parseArgs,

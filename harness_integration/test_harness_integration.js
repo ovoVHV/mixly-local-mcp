@@ -68,6 +68,16 @@ async function main() {
     generation: '4'
   });
   assert.equal(launcher.instanceKey('C:\\Mixly'), launcher.instanceKey('c:\\mixly'));
+  assert.equal(
+    launcher.stableContextKey({ mixlyHome: 'C:\\Mixly', generation: '4', origin: 'http://localhost:65234', cdpPort: '9347' }),
+    launcher.stableContextKey({ mixlyHome: 'c:\\mixly', generation: '4', origin: 'http://localhost:65234', cdpPort: '' }),
+    'CDP port changes must not force a Harness restart for the same Mixly installation'
+  );
+  assert.notEqual(
+    launcher.stableContextKey({ mixlyHome: 'C:\\Mixly', generation: '4', origin: 'http://localhost:65234' }),
+    launcher.stableContextKey({ mixlyHome: 'C:\\Mixly', generation: '2', origin: '' }),
+    'generation changes must still require a new Harness context'
+  );
   const port = await launcher.choosePort();
   assert(port >= 3080 && port <= 3099);
 
@@ -77,6 +87,7 @@ async function main() {
   assert(adapterSource.includes('event.isTrusted'));
   assert(adapterSource.includes('Mixly AI · Mixly'));
   assert(adapterSource.includes('mixly-harness-panel-state-v1'));
+  assert(adapterSource.includes('contextRefreshSkipped'));
   assert(adapterSource.includes("candidate('fs')"));
   assert(!adapterSource.includes('nw.Window.open'));
   assert(!adapterSource.includes("layui-btn-primary mixly-nav"));
