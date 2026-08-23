@@ -1,5 +1,10 @@
 # 更新日志
 
+## 2.5.15 - 2026-08-23
+
+- 修复 `legacy-peer-deps` 导致 `@deepseek-ai/cordis-plugin-group` 等运行时 peer 依赖被省略、最终校验失败的问题。
+- 安装器会检查关键运行包；即使 CLI 文件存在但依赖不完整，也会自动补齐而不是直接进入失败校验。
+
 ## 2.5.14 - 2026-08-23
 
 - 发布包内置 DeepSeek Harness lockfile，避免首次安装时 npm 长时间解析 500 多个依赖。

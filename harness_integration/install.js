@@ -307,7 +307,11 @@ async function ensureDshRuntime(installRoot, nodePath) {
     if (needsLock) copyFile(bundledLockPath, lockPath);
   }
 
-  if (!fs.existsSync(cliPath)) {
+  const requiredRuntimeModules = [
+    path.join(appRoot, 'node_modules', '@deepseek-ai', 'cordis-plugin-group', 'package.json')
+  ];
+  const runtimeComplete = fs.existsSync(cliPath) && requiredRuntimeModules.every((filePath) => fs.existsSync(filePath));
+  if (!runtimeComplete) {
     stageProgress('Install progress', 55, `Installing DeepSeek Harness ${DSH_VERSION}`);
     const npmCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
     const npmRegistry = process.env.MIXLY_NPM_REGISTRY || DEFAULT_NPM_REGISTRY;
@@ -327,7 +331,6 @@ async function ensureDshRuntime(installRoot, nodePath) {
           '--loglevel=verbose',
           '--fetch-timeout=20000',
           '--fetch-retries=1',
-          '--legacy-peer-deps',
           '--prefer-offline',
           '--replace-registry-host=always',
           '--registry',
