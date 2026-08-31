@@ -10,6 +10,8 @@ This integration adds one AI toolbar button to Mixly and starts the official Dee
 - Mixly 4 patches its shared `boards/index.html`, so every board page gets the button. `MixlyHarness_Mixly4_Plugin.zip` remains a compatibility fallback and contributes no toolbox blocks.
 - Mixly 2/3/4 reuse one Harness runtime. Each running Harness process pins one Mixly installation; switching installations restarts the process instead of mutating a live chat context.
 - Existing Harness settings and sessions stay shared, while the process working directory and pinned MCP context follow the selected Mixly installation. The panel title shows the pinned generation.
+- Mixly 2/3 store their absolute installation path in the adapter tag and receive browser API polyfills required by Electron 19 / Chromium 102.
+- Opening the panel creates or reuses the current Mixly workspace and a blank session before the UI is shown.
 
 ## Local install
 

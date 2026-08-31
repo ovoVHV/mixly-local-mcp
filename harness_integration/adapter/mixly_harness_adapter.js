@@ -7,6 +7,11 @@
   const script = document.currentScript;
   const configuredGeneration = Number(script && script.dataset.mixlyGeneration || 0);
   const generation = Number(globalThis.__MIXLY_HARNESS_GENERATION__ || configuredGeneration || 0);
+  const configuredMixlyHome = String(
+    script && script.dataset.mixlyHome
+    || globalThis.__MIXLY_HARNESS_HOME__
+    || ''
+  ).trim();
   const buttonId = 'mixly-harness-button';
   const panelId = 'mixly-harness-panel';
   const panelStateKey = 'mixly-harness-panel-state-v1';
@@ -71,6 +76,17 @@
 
   function writePanelState(value) {
     try { sessionStorage.setItem(panelStateKey, JSON.stringify(value)); } catch (_) { /* optional persistence */ }
+  }
+
+  function normalizeHarnessUrl(value) {
+    try {
+      const url = new URL(String(value || ''));
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.pathname !== '/') return '';
+      if (generation === 2 || generation === 3) url.searchParams.set('mixlyLegacyCompat', '1');
+      return url.href;
+    } catch (_) {
+      return '';
+    }
   }
 
   function ensurePanelStyles() {
@@ -204,7 +220,8 @@
   }
 
   function openHarness(url, activeContext) {
-    harnessUrl = url;
+    harnessUrl = normalizeHarnessUrl(url);
+    if (!harnessUrl) throw new Error('Harness 返回了无效的本地地址');
     const panel = createPanel();
     const activeGeneration = String(activeContext && activeContext.generation || generation || '?');
     const title = panel.querySelector('.mixly-harness-title');
@@ -214,18 +231,18 @@
     const nav = document.querySelector('.mixly-nav, #nav, .layui-nav');
     if (nav) panel.style.top = `${Math.max(35, Math.round(nav.getBoundingClientRect().bottom))}px`;
     const frame = panel.querySelector('.mixly-harness-frame');
-    if (frame.src !== url && frame.src !== `${url}/`) {
+    if (frame.src !== harnessUrl) {
       panel.dataset.loaded = 'false';
-      frame.src = url;
+      frame.src = harnessUrl;
     }
     panel.dataset.open = 'true';
-    writePanelState({ open: true, url, activeContext: activeContext || { generation } });
+    writePanelState({ open: true, url: harnessUrl, activeContext: activeContext || { generation } });
     panel.querySelector('.mixly-harness-close').focus();
   }
 
   function restoreHarnessPanel() {
     const saved = readPanelState();
-    if (!saved || saved.open !== true || !/^http:\/\/127\.0\.0\.1:\d+\/?$/.test(String(saved.url || ''))) return;
+    if (!saved || saved.open !== true || !normalizeHarnessUrl(saved.url)) return;
     openHarness(saved.url, saved.activeContext || { generation, mixlyHome: '' });
   }
 
@@ -272,7 +289,7 @@
       const args = [
         launcherPath,
         '--mixly-home',
-        process.cwd(),
+        configuredMixlyHome || process.cwd(),
         '--generation',
         String(generation),
         '--response',

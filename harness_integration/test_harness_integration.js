@@ -2,6 +2,7 @@
 
 const assert = require('node:assert');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
@@ -81,6 +82,44 @@ async function main() {
   const port = await launcher.choosePort();
   assert(port >= 3080 && port <= 3099);
 
+  const rpcCalls = [];
+  const rpcServer = http.createServer((request, response) => {
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(chunk));
+    request.on('end', () => {
+      const message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      rpcCalls.push(message.method);
+      let value;
+      if (message.method === 'workspace.create') {
+        value = { workspace: { workspaceId: 'workspace-1', path: 'C:\\Mixly' }, created: false };
+      } else if (message.method === 'session.list') {
+        value = { items: [{ sessionId: 'session-1', blank: true, cwd: 'c:\\mixly' }] };
+      } else {
+        response.writeHead(500).end();
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        type: 'server-response',
+        rpcId: message.rpcId,
+        result: { ok: true, value }
+      }));
+    });
+  });
+  await new Promise((resolve) => rpcServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = rpcServer.address();
+    const workspace = await launcher.ensureHarnessWorkspace(`http://127.0.0.1:${address.port}`, 'C:\\Mixly', 2000);
+    assert.deepEqual(workspace, {
+      workspaceId: 'workspace-1',
+      sessionId: 'session-1',
+      createdSession: false
+    });
+    assert.deepEqual(rpcCalls, ['workspace.create', 'session.list']);
+  } finally {
+    await new Promise((resolve, reject) => rpcServer.close((error) => error ? reject(error) : resolve()));
+  }
+
   const adapterSource = fs.readFileSync(path.join(__dirname, 'adapter', 'mixly_harness_adapter.js'), 'utf8');
   new vm.Script(adapterSource, { filename: 'mixly_harness_adapter.js' });
   assert(adapterSource.includes('mixly-harness-frame'));
@@ -88,6 +127,8 @@ async function main() {
   assert(adapterSource.includes('Mixly AI · Mixly'));
   assert(adapterSource.includes('mixly-harness-panel-state-v1'));
   assert(adapterSource.includes('contextRefreshSkipped'));
+  assert(adapterSource.includes('configuredMixlyHome || process.cwd()'));
+  assert(adapterSource.includes("url.searchParams.set('mixlyLegacyCompat', '1')"));
   assert(adapterSource.includes("candidate('fs')"));
   assert(!adapterSource.includes('nw.Window.open'));
   assert(!adapterSource.includes("layui-btn-primary mixly-nav"));
@@ -99,10 +140,34 @@ async function main() {
     installer.patchBoardsHtml(mixly4Fixture, 4);
     const patchedHtml = fs.readFileSync(installed.htmlPath, 'utf8');
     assert(patchedHtml.includes('data-mixly-generation="4"'));
+    assert(patchedHtml.includes(`data-mixly-home="${mixly4Fixture}"`));
     assert.equal((patchedHtml.match(/mixly-harness:start/g) || []).length, 1);
     assert(fs.existsSync(installed.adapterPath));
   } finally {
     fs.rmSync(mixly4Fixture, { recursive: true, force: true });
+  }
+  const runtimeFixture = fs.mkdtempSync(path.join(os.tmpdir(), 'mixly-harness-runtime-'));
+  try {
+    const frontend = path.join(
+      runtimeFixture,
+      'runtime',
+      'dsh-app',
+      'node_modules',
+      '@deepseek-ai',
+      'dsh-web-frontend',
+      'dist'
+    );
+    fs.mkdirSync(frontend, { recursive: true });
+    const indexPath = path.join(frontend, 'index.html');
+    fs.writeFileSync(indexPath, '<!doctype html><html><head></head><body></body></html>', 'utf8');
+    assert.equal(installer.installLegacyBrowserCompat(runtimeFixture), true);
+    assert.equal(installer.installLegacyBrowserCompat(runtimeFixture), true);
+    const patchedRuntime = fs.readFileSync(indexPath, 'utf8');
+    assert(patchedRuntime.includes('AbortSignal.timeout'));
+    assert(patchedRuntime.includes('AbortSignal.any'));
+    assert.equal((patchedRuntime.match(/mixly-legacy-browser-compat:start/g) || []).length, 1);
+  } finally {
+    fs.rmSync(runtimeFixture, { recursive: true, force: true });
   }
   const pluginSource = fs.readFileSync(path.join(__dirname, 'mixly4_plugin', 'index.js'), 'utf8');
   assert(pluginSource.includes("export { blocks, generators }"));

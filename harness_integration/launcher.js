@@ -106,6 +106,98 @@ function requestHealthy(url, timeoutMs = 1000) {
   });
 }
 
+function postHarnessRpc(baseUrl, method, payload = {}, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`/api/${method}`, baseUrl);
+    const rpcId = crypto.randomUUID();
+    const body = Buffer.from(JSON.stringify({
+      type: 'client-request',
+      rpcId,
+      method,
+      payload
+    }), 'utf8');
+    const request = http.request(url, {
+      method: 'POST',
+      timeout: timeoutMs,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': body.length
+      }
+    }, (response) => {
+      const chunks = [];
+      let length = 0;
+      response.on('data', (chunk) => {
+        length += chunk.length;
+        if (length <= 2 * 1024 * 1024) chunks.push(chunk);
+      });
+      response.on('end', () => {
+        if (length > 2 * 1024 * 1024) {
+          reject(new Error(`Harness ${method} response is too large`));
+          return;
+        }
+        let message;
+        try {
+          message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch (error) {
+          reject(new Error(`Harness ${method} returned invalid JSON: ${error.message}`));
+          return;
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`Harness ${method} failed with HTTP ${response.statusCode}`));
+          return;
+        }
+        if (message.rpcId !== rpcId || !message.result) {
+          reject(new Error(`Harness ${method} returned an invalid RPC response`));
+          return;
+        }
+        if (!message.result.ok) {
+          const detail = message.result.error && message.result.error.message || 'unknown error';
+          reject(new Error(`Harness ${method} failed: ${detail}`));
+          return;
+        }
+        resolve(message.result.value);
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error(`Harness ${method} timed out`)));
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
+function sameDirectory(left, right) {
+  if (!left || !right) return false;
+  const normalize = (value) => path.resolve(String(value)).replace(/[\\/]+$/, '').toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
+async function ensureHarnessWorkspace(baseUrl, mixlyHome, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const createdWorkspace = await postHarnessRpc(baseUrl, 'workspace.create', { path: mixlyHome });
+      const workspace = createdWorkspace && createdWorkspace.workspace || createdWorkspace;
+      if (!workspace || !workspace.workspaceId) throw new Error('workspace.create did not return a workspace id');
+      const sessions = await postHarnessRpc(baseUrl, 'session.list', {});
+      const existing = Array.isArray(sessions && sessions.items)
+        ? sessions.items.find((item) => item.blank === true && sameDirectory(item.cwd, mixlyHome))
+        : null;
+      const session = existing || await postHarnessRpc(baseUrl, 'session.create', {
+        workspaceId: workspace.workspaceId
+      });
+      return {
+        workspaceId: workspace.workspaceId,
+        sessionId: session.sessionId,
+        createdSession: !existing
+      };
+    } catch (error) {
+      lastError = error;
+      await sleep(350);
+    }
+  }
+  throw new Error(`Harness 工作区初始化失败：${lastError && lastError.message || '服务未就绪'}`);
+}
+
 function probeCdp(port, origin, timeoutMs = 250) {
   return new Promise((resolve) => {
     const request = http.get(`http://127.0.0.1:${port}/json/list`, { timeout: timeoutMs }, (response) => {
@@ -291,6 +383,7 @@ async function startHarnessUnlocked(options, installRoot, stateDir) {
     && stableContextKey(previous.activeContext) === stableContextKey(activeContext)
     && stableContextKey(persistedContext) === stableContextKey(activeContext)
   ) {
+    const workspace = await ensureHarnessWorkspace(previous.url, mixlyHome);
     const contextRefreshSkipped = contextKey(previous.activeContext) !== contextKey(activeContext);
     // Keep the context pinned to the running Harness. Updating this file with
     // a new CDP port would make the next MCP child disagree with the live
@@ -298,10 +391,12 @@ async function startHarnessUnlocked(options, installRoot, stateDir) {
     const result = {
       ...previous,
       ok: true,
+      status: 'ready',
       reused: true,
       restarted: false,
       contextRefreshSkipped,
-      requestedContext: contextRefreshSkipped ? activeContext : undefined
+      requestedContext: contextRefreshSkipped ? activeContext : undefined,
+      workspace
     };
     if (!contextRefreshSkipped) delete result.requestedContext;
     writeJsonAtomic(statePath, result);
@@ -380,7 +475,14 @@ async function startHarnessUnlocked(options, installRoot, stateDir) {
     if (await requestHealthy(url, 1200)) {
       await sleep(600);
       if (canSignal(child.pid) && await requestHealthy(url, 1200)) {
-        const ready = { ...starting, ok: true, status: 'ready', readyAt: new Date().toISOString() };
+        const workspace = await ensureHarnessWorkspace(url, mixlyHome);
+        const ready = {
+          ...starting,
+          ok: true,
+          status: 'ready',
+          readyAt: new Date().toISOString(),
+          workspace
+        };
         writeJsonAtomic(statePath, ready);
         if (responsePath) writeJsonAtomic(responsePath, ready);
         return ready;
@@ -432,8 +534,10 @@ module.exports = {
   discoverCdpPort,
   instanceKey,
   parseArgs,
+  postHarnessRpc,
   requestHealthy,
   runtimePaths,
+  ensureHarnessWorkspace,
   stopRunning,
   startHarness
 };

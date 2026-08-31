@@ -389,6 +389,66 @@ function installSharedFiles(installRoot, mcpSource) {
   copyTree(path.join(mcpSource, 'node_modules'), path.join(mcpRoot, 'node_modules'));
 }
 
+function installLegacyBrowserCompat(installRoot) {
+  const indexPath = path.join(
+    installRoot,
+    'runtime',
+    'dsh-app',
+    'node_modules',
+    '@deepseek-ai',
+    'dsh-web-frontend',
+    'dist',
+    'index.html'
+  );
+  if (!fs.existsSync(indexPath)) return false;
+  const start = '<!-- mixly-legacy-browser-compat:start -->';
+  const end = '<!-- mixly-legacy-browser-compat:end -->';
+  const script = `${start}
+    <script>
+      (() => {
+        if (typeof AbortSignal.timeout !== 'function') {
+          AbortSignal.timeout = (milliseconds) => {
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(), Math.max(0, Number(milliseconds) || 0));
+            return controller.signal;
+          };
+        }
+        if (typeof AbortSignal.any !== 'function') {
+          AbortSignal.any = (signals) => {
+            const controller = new AbortController();
+            const abort = () => controller.abort();
+            for (const signal of signals) {
+              if (signal.aborted) {
+                abort();
+                break;
+              }
+              signal.addEventListener('abort', abort, { once: true });
+            }
+            return controller.signal;
+          };
+        }
+        if (typeof Promise.withResolvers !== 'function') {
+          Promise.withResolvers = () => {
+            let resolve;
+            let reject;
+            const promise = new Promise((onResolve, onReject) => {
+              resolve = onResolve;
+              reject = onReject;
+            });
+            return { promise, resolve, reject };
+          };
+        }
+      })();
+    </script>
+    ${end}`;
+  let html = fs.readFileSync(indexPath, 'utf8');
+  const expression = new RegExp(`${start}[\\s\\S]*?${end}`, 'g');
+  if (expression.test(html)) html = html.replace(expression, script);
+  else html = html.replace(/<head>/i, `<head>\n    ${script}`);
+  fs.writeFileSync(indexPath, html, 'utf8');
+  return true;
+}
+
 function patchBoardsHtml(mixlyHome, generation) {
   const root = path.resolve(mixlyHome);
   const appRoot = generation === 2 ? path.join(root, 'resources', 'app', 'src') : root;
@@ -399,7 +459,12 @@ function patchBoardsHtml(mixlyHome, generation) {
 
   const start = '<!-- mixly-harness:start -->';
   const end = '<!-- mixly-harness:end -->';
-  const tag = `${start}\n    <script type="text/javascript" src="../mixly-harness/adapter.js" data-mixly-generation="${generation}"></script>\n    ${end}`;
+  const encodedRoot = root
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  const tag = `${start}\n    <script type="text/javascript" src="../mixly-harness/adapter.js" data-mixly-generation="${generation}" data-mixly-home="${encodedRoot}"></script>\n    ${end}`;
   let html = fs.readFileSync(htmlPath, 'utf8');
   const expression = new RegExp(`${start}[\\s\\S]*?${end}`, 'g');
   if (expression.test(html)) html = html.replace(expression, tag);
@@ -447,6 +512,7 @@ async function main() {
   } else if (!fs.existsSync(dshCli)) {
     dshCli = null;
   }
+  const legacyBrowserCompat = installLegacyBrowserCompat(installRoot);
 
   const legacy = [];
   for (const home of options.mixly2) legacy.push(patchBoardsHtml(home, 2));
@@ -462,6 +528,7 @@ async function main() {
     dshVersion: DSH_VERSION,
     nodePath,
     dshCli,
+    legacyBrowserCompat,
     mcpServer: path.join(installRoot, 'mcp', 'mixly_mcp_server.js'),
     mixly4Plugin: path.join(installRoot, 'MixlyHarness_Mixly4_Plugin.zip'),
     mixly4,
@@ -483,6 +550,7 @@ module.exports = {
   formatBytes,
   formatDuration,
   parseArgs,
+  installLegacyBrowserCompat,
   patchBoardsHtml,
   stageMixly4Plugin
 };

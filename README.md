@@ -1,4 +1,4 @@
-# Mixly Local MCP 2.5.15
+# Mixly Local MCP 2.5.16
 
 下载 ZIP 后解压到本地 Mixly 目录，再在 AI 客户端中配置并调用。
 
@@ -12,6 +12,12 @@
 - 哔哩哔哩：[Mixly 米思齐巨好用的 AI 编程工具，调用 MCP 即可帮你编写代码](https://b23.tv/HU2z2vd)
 
 以上为平台短链接，打开后会跳转到对应视频页面。
+
+## 2.5.16 更新说明
+
+- 修复 Mixly 2/3 AI 打开后工作区一直加载或完全不可用：旧版 Electron 缺少 Harness 使用的现代浏览器 API，现在安装器会自动加入兼容层。
+- 2/3 代不再依赖进程当前目录，安装时会把正确的 Mixly 绝对路径写入按钮适配器。
+- 打开 AI 时会自动注册并选中当前 Mixly 工作区，同时复用已有空白会话。
 
 ## 2.5.15 更新说明
 
@@ -182,7 +188,7 @@ node harness_integration\install.js `
 分发文件：
 
 ```text
-Mixly_Local_MCP_v2.5.15.zip
+Mixly_Local_MCP_v2.5.16.zip
 ```
 
 解压后目录包含：
@@ -213,7 +219,7 @@ MixlyLocalMCP/
 
 ### 分代一键安装
 
-1. 下载 `Mixly_Local_MCP_v2.5.15.zip` 并解压到任意目录。
+1. 下载 `Mixly_Local_MCP_v2.5.16.zip` 并解压到任意目录。
 2. Mixly 4 用户双击 `MixlyLocalMCP\Install_Mixly4_AI.cmd`。
 3. Mixly 2/3 用户双击 `MixlyLocalMCP\Install_Mixly23_AI.cmd`。安装器会自动扫描父目录；只有扫描不到时才要求填写 Mixly 2/3 根目录。
 4. 安装器会下载并保存便携 Node.js、安装 DeepSeek Harness，把 MCP 和对应代际的 AI 按钮写入 `%LOCALAPPDATA%\\MixlyHarness` 以及各自的板卡页面。

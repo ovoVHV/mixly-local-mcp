@@ -1,5 +1,12 @@
 # 更新日志
 
+## 2.5.16 - 2026-08-31
+
+- 修复 Mixly 2/3 从错误的 `process.cwd()` 启动 Harness，安装器现在把每一代的绝对根目录写入适配器配置。
+- 为 Electron 19 / Chromium 102 注入 `AbortSignal.timeout`、`AbortSignal.any` 和 `Promise.withResolvers` 兼容层，修复 AI 面板打开后连接反复中断、工作区一直加载的问题。
+- Harness 启动后自动创建或复用当前 Mixly 工作区和空白会话，用户不再需要手工选择工作区。
+- 修复复用运行中 Harness 时状态仍显示 `starting`，并给旧版面板 URL 增加兼容缓存标识。
+
 ## 2.5.15 - 2026-08-23
 
 - 修复 `legacy-peer-deps` 导致 `@deepseek-ai/cordis-plugin-group` 等运行时 peer 依赖被省略、最终校验失败的问题。
